@@ -1,0 +1,156 @@
+{
+  "project_name": "e-dikiΜου",
+  "app_type": "hybrid_fullstack (Legal SaaS Productivity Dashboard)",
+  "language": "el (Greek)",
+  "theme_strategy": {
+    "default_mode": "dark",
+    "toggle_supported": true,
+    "archetype": "High-Precision Hellenic Legal Tech (Swiss & Luxury Old Money Hybrid)",
+    "description": "Authoritative, serene, and ultra-readable for Greek lawyers. Uses deep graphite obsidian backgrounds, warm marble accents, golden gavel highlights, and crisp status badges."
+  },
+  "typography": {
+    "font_families": {
+      "heading": "'Playfair Display', 'Merriweather', serif",
+      "body": "'Plus Jakarta Sans', 'Manrope', -apple-system, sans-serif",
+      "mono": "'JetBrains Mono', 'Fira Code', monospace"
+    },
+    "google_fonts_url": "https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,600;0,700;1,600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap",
+    "scale_rules": {
+      "h1": "text-3xl sm:text-4xl lg:text-5xl font-semibold tracking-tight",
+      "h2": "text-2xl sm:text-3xl font-semibold tracking-tight",
+      "h3": "text-xl sm:text-2xl font-medium",
+      "h4": "text-lg font-medium",
+      "body": "text-sm sm:text-base leading-relaxed",
+      "label": "text-xs font-semibold uppercase tracking-wider text-muted-foreground",
+      "mono_badge": "font-mono text-xs sm:text-sm font-semibold tracking-wide"
+    }
+  },
+  "color_palette": {
+    "dark_mode": {
+      "bg_base": "#0B0F17",
+      "bg_surface": "#121824",
+      "bg_surface_elevated": "#1A2332",
+      "bg_overlay": "#222D3E",
+      "border": "#2A364F",
+      "border_accent": "#C5A059",
+      "text_primary": "#F1F5F9",
+      "text_secondary": "#94A3B8",
+      "text_muted": "#64748B",
+      "gold_accent": "#D4AF37",
+      "gold_glow": "rgba(212, 175, 55, 0.15)",
+      "navy_primary": "#1E293B"
+    },
+    "light_mode": {
+      "bg_base": "#F8FAFC",
+      "bg_surface": "#FFFFFF",
+      "bg_surface_elevated": "#F1F5F9",
+      "border": "#E2E8F0",
+      "border_accent": "#C5A059",
+      "text_primary": "#0F172A",
+      "text_secondary": "#475569",
+      "text_muted": "#94A3B8",
+      "gold_accent": "#B8860B",
+      "navy_primary": "#0F172A"
+    },
+    "semantic_statuses": {
+      "dikazetai": {
+        "bg": "bg-amber-500/15 dark:bg-amber-500/20",
+        "border": "border-amber-500/50",
+        "text": "text-amber-600 dark:text-amber-400",
+        "badge_glow": "shadow-[0_0_12px_rgba(245,158,11,0.35)]",
+        "label_el": "Δικάζεται"
+      },
+      "anamenetai": {
+        "bg": "bg-sky-500/10 dark:bg-sky-500/20",
+        "border": "border-sky-500/30",
+        "text": "text-sky-600 dark:text-sky-400",
+        "label_el": "Αναμένεται"
+      },
+      "diakopike": {
+        "bg": "bg-orange-500/10 dark:bg-orange-500/20",
+        "border": "border-orange-500/30",
+        "text": "text-orange-600 dark:text-orange-400",
+        "label_el": "Διακόπηκε"
+      },
+      "oloklirothike": {
+        "bg": "bg-emerald-500/10 dark:bg-emerald-500/20",
+        "border": "border-emerald-500/30",
+        "text": "text-emerald-600 dark:text-emerald-400",
+        "label_el": "Ολοκληρώθηκε"
+      },
+      "anavlithike": {
+        "bg": "bg-rose-500/10 dark:bg-rose-500/20",
+        "border": "border-rose-500/30",
+        "text": "text-rose-600 dark:text-rose-400",
+        "label_el": "Αναβλήθηκε"
+      }
+    }
+  },
+  "layout_and_components": {
+    "header": {
+      "title": "e-dikiΜου",
+      "tagline": "Παρακολούθηση Πινακίων Δικαστηρίων σε Πραγματικό Χρόνο",
+      "elements": [
+        "Hellenic justice emblem / scales icon badge",
+        "Live Feed Health Indicator (Live e-diki Feed Status)",
+        "In-app Notification Bell with unread counter",
+        "Group Switcher dropdown (Δικηγορικό Γραφείο / Ομάδα)",
+        "Dark / Light Mode Toggle",
+        "User Profile & Logout"
+      ]
+    },
+    "now_hearing_banner": {
+      "component_name": "NowHearingBanner",
+      "description": "High-visibility focal point card displaying the current case number being heard ('Τώρα Δικάζεται') in selected courthouse/court.",
+      "features": [
+        "Animated pulsing live badge 'ΖΩΝΤΑΝΗ ΣΥΝΕΔΡΙΑΣΗ'",
+        "Current case serial number (π.χ. 'Σειρά #12')",
+        "Courtroom hall info (π.χ. 'Μονομελές Πρωτοδικείο Αθηνών - Αίθουσα 4')",
+        "Offense / Procedure type label",
+        "Real-time countdown or case ahead ticker"
+      ]
+    },
+    "case_form": {
+      "component_name": "AddCaseModalOrForm",
+      "description": "Cascading dropdown form matching official e-diki.justice.gov.gr parameters.",
+      "fields": [
+        {"name": "date", "label_el": "Ημερομηνία", "type": "date", "required": true},
+        {"name": "type", "label_el": "Τύπος Δικαστηρίου", "type": "select", "options": ["Πολιτικά", "Ποινικά", "Διοικητικά"], "required": true},
+        {"name": "location", "label_el": "Κατάστημα / Πόλη", "type": "select", "options": ["Αθήνα (Πρώην Σχολή Ευελπίδων)", "Θεσσαλονίκη", "Πειραιάς", "Πάτρα", "Ηράκλειο", "Λάρισα"], "required": true},
+        {"name": "court", "label_el": "Δικαστήριο", "type": "select", "options": ["Πρωτοδικείο", "Εφετείο", "Ειρηνοδικείο", "Πταισματοδικείο"], "required": true},
+        {"name": "procedure", "label_el": "Διαδικασία", "type": "select", "options": ["Ασφαλιστικά Μέτρα", "Τακτική Διαδικασία", "Ειδική Διαδικασία", "Ανακοπές", "Εκούσια Δικαιοδοσία"], "required": true},
+        {"name": "case_number", "label_el": "Αριθμός Υπόθεσης / Πινακίου", "type": "input_text", "placeholder": "π.χ. 1042/2026", "required": true},
+        {"name": "notification_email", "label_el": "Email Ειδοποιήσεων", "type": "input_email", "placeholder": "dikigoros@lawfirm.gr", "required": true}
+      ]
+    },
+    "dashboard_grid": {
+      "layout_pattern": "Bento Grid Mode B (Dense SaaS Dashboard)",
+      "cards": [
+        "Tracked Cases List (Κάρτες Υποθέσεων με live status, σειρά, remaining count ahead)",
+        "Now Hearing Priority Highlight",
+        "Feed Health Status (Κατάσταση Live Connection)",
+        "Notification Log Drawer",
+        "Group Management Panel (Διαμοιρασμός Υποθέσεων Γραφείου)"
+      ]
+    }
+  },
+  "image_urls": {
+    "login_hero_bg": "https://images.unsplash.com/photo-1761700971099-6696edc79a8b?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1MDZ8MHwxfHNlYXJjaHwzfHxjb3VydHJvb20lMjBqdXN0aWNlJTIwbGF3eWVyJTIwc2NhbGVzJTIwbGVnYWwlMjBidWlsZGluZyUyMEdyZWVjZXxlbnwwfHx8fDE3OTEwNjc0NDR8MA&ixlib=rb-4.1.0&q=85",
+    "court_greek_staircase": "https://images.unsplash.com/photo-1759613105252-2da52556a039?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1MDZ8MHwxfHNlYXJjaHw0fHxjb3VydHJvb20lMjBqdXN0aWNlJTIwbGF3eWVyJTIwc2NhbGVzJTIwbGVnYWwlMjBidWlsZGluZyUyMEdyZWVjZXxlbnwwfHx8fDE3OTEwNjc0NDR8MA&ixlib=rb-4.1.0&q=85",
+    "lady_justice_gavel": "https://images.unsplash.com/photo-1774898988393-5c752e4d55e9?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2MzR8MHwxfHNlYXJjaHwzfHxsYXd5ZXIlMjBnYXZlbCUyMGp1c3RpY2UlMjBzY2FsZXMlMjBwYXBlciUyMGRvY3VtZW50c3xlbnwwfHx8fDE3OTEwNjc0NTJ8MA&ixlib=rb-4.1.0&q=85"
+  },
+  "instructions_to_main_agent": [
+    "Ensure ALL user-facing text is written in natural, fluent Greek (Ελληνικά).",
+    "Use JetBrains Mono or monospace styling for case numbers, serials, and timestamps.",
+    "Do NOT rely on transparent dropdowns or unreadable contrast. All select popovers and dialogs must have solid dark/light background with crisp border.",
+    "Add data-testid attributes to all interactive elements, e.g., data-testid='add-case-button', data-testid='case-card-1042', data-testid='status-badge-dikazetai', data-testid='group-select-dropdown'.",
+    "Implement Sonner toast notifications when a case reaches 'Δικάζεται' or when 'Υπολείπονται 2 υποθέσεις'.",
+    "Provide mock interactive features for adding cases, switching court feeds, simulating live status progression, joining groups, and sending email alerts."
+  ],
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": {
+    "no_ai_slop": "Avoid generic pastel rounded boxes. Use structured slate tiles, thin warm brass borders, crisp typography, and real legal domain context.",
+    "testing_requirement": "All buttons, inputs, modals, status chips, and list items MUST include role-based data-testid attributes.",
+    "component_reuse": "Use pre-existing Shadcn components from src/components/ui/ customized with high-contrast Tailwind styling.",
+    "toasts": "Use sonner for instant in-app alerts when case statuses update."
+  }
+}
