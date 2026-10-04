@@ -101,3 +101,5 @@ select.field { appearance: none; -webkit-appearance: none;
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: #D2D2D7; border-radius: 10px; }
 ::-webkit-scrollbar-thumb:hover { background: #B8B8BF; }
+
+.elev { background: var(--bg); border: 1px solid var(--border); }

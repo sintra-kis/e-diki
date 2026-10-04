@@ -6,7 +6,10 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 import asyncio
+import hashlib
+import hmac
 import logging
+import secrets
 import re
 import uuid
 import ipaddress
@@ -14,7 +17,8 @@ from datetime import datetime, timezone, timedelta
 from html import escape
 from html.parser import HTMLParser
 from urllib.parse import urlparse
-from typing import Optional, List
+from typing import Optional, List, Literal
+from zoneinfo import ZoneInfo
 
 import bcrypt
 import jwt
@@ -23,7 +27,9 @@ from bson import ObjectId
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, TypeAdapter, field_validator, model_validator
+
+from docket_logic import analyze
 
 # ----------------------------------------------------------------------------
 # Config / DB
@@ -255,7 +261,7 @@ def make_call(to: str, text: str) -> bool:
         logger.warning("Call skipped (twilio not configured or bad number)")
         return False
     try:
-        twiml = (f'<Response><Say language="el-GR" voice="Polly.Aditi">{escape(text)}</Say>'
+        twiml = (f'<Response><Say language="el-GR" voice="Google.el-GR-Standard-A">{escape(text)}</Say>'
                  f'<Pause length="1"/><Say language="el-GR">{escape(text)}</Say></Response>')
         _twilio_client.calls.create(to=num, from_=TWILIO_FROM, twiml=twiml)
         return True
@@ -264,7 +270,7 @@ def make_call(to: str, text: str) -> bool:
         return False
 
 
-async def dispatch_alert(tc: dict, subject: str, lines: List[str], short_text: str):
+async def dispatch_alert(tc: dict, subject: str, lines: List[str], short_text: str, voice: bool = True):
     channels = tc.get("notify_channels") or ["email"]
     if "email" in channels and tc.get("notify_email"):
         await send_email(to=tc["notify_email"], subject=f"[e-dikiΜου] {subject}",
@@ -272,17 +278,28 @@ async def dispatch_alert(tc: dict, subject: str, lines: List[str], short_text: s
     phone = tc.get("phone")
     if phone and "sms" in channels:
         await asyncio.to_thread(send_sms, phone, f"e-dikiΜου: {short_text}")
-    if phone and "call" in channels:
+    if phone and voice and "call" in channels:
         await asyncio.to_thread(make_call, phone, short_text)
 
 
 # ----------------------------------------------------------------------------
 # e-diki client + status logic
 # ----------------------------------------------------------------------------
+_http: Optional[httpx.AsyncClient] = None
+
+
+def _client() -> httpx.AsyncClient:
+    """One shared client so connections to e-diki are reused across checks."""
+    global _http
+    if _http is None:
+        _http = httpx.AsyncClient(timeout=20)
+    return _http
+
+
 async def ediki_get(path: str, params: dict) -> Optional[object]:
     try:
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.get(f"{EDIKI_BASE}{path}", params={k: v for k, v in params.items() if v not in (None, "")})
+        r = await _client().get(f"{EDIKI_BASE}{path}",
+                                params={k: v for k, v in params.items() if v not in (None, "")})
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -290,129 +307,42 @@ async def ediki_get(path: str, params: dict) -> Optional[object]:
         return None
 
 
-def norm_status(status, end_reason, result):
-    if status in ("CASE_START", "CASE_RESUME"):
-        return ("dikazetai", "Δικάζεται")
-    if status == "CASE_PAUSE":
-        return ("diakopike", "Διακόπηκε")
-    if status == "CASE_END":
-        rl = ((result or "") + " " + (end_reason or "")).lower()
-        if "αναβ" in rl or "postpon" in rl or "μαται" in rl:
-            return ("anavlithike", "Αναβλήθηκε")
-        if end_reason == "CASE_END_WITHOUT_PRONUNCIATION":
-            return ("oloklirothike", "Ολοκληρώθηκε (χωρίς εκφώνηση)")
-        return ("oloklirothike", "Ολοκληρώθηκε")
-    return ("anamenetai", "Αναμένεται")
+# Dropdown options (courts, kinds, categories) change rarely; cache them briefly.
+_OPTIONS_TTL = 6 * 3600
+_options_cache: dict = {}
 
 
-def serial_val(s):
-    try:
-        return float(re.sub(r"[^0-9.]", "", str(s)) or 1e9)
-    except Exception:
-        return 1e9
+async def ediki_options(path: str, params: dict, date: Optional[str] = None) -> list:
+    """Dropdown values exactly as e-diki returns them.
+
+    The form's date filter hides courts without a docket on that day (which is why courts
+    such as Σύρος or Φλώρινα went missing), so ask for the full, date-independent list first
+    and fall back to the date-restricted query only if that comes back empty.
+    """
+    key = (path, tuple(sorted((k, v) for k, v in params.items() if v)))
+    hit = _options_cache.get(key)
+    if hit and hit[0] > datetime.now(timezone.utc).timestamp():
+        return hit[1]
+    data = await ediki_get(path, params)
+    if not data and date:
+        data = await ediki_get(path, {**params, "courtDateFrom": date, "courtDateTo": date})
+    data = data if isinstance(data, list) else []
+    if data:
+        _options_cache[key] = (datetime.now(timezone.utc).timestamp() + _OPTIONS_TTL, data)
+    return data
 
 
-def case_number_matches(entered: str, case: dict) -> bool:
-    def clean(x):
-        return re.sub(r"\s+", "", str(x or "")).lower()
-    e = clean(entered)
-    if not e:
-        return False
-    for f in ("code", "eak", "gak", "abm", "subCode", "serialNumber"):
-        v = clean(case.get(f))
-        if v and (e == v or e in v or v in e):
-            return True
-    return False
-
-
-def case_subject(case: dict, docket: dict) -> str:
-    parts = []
-    if case.get("description"):
-        parts.append(str(case["description"]))
-    if case.get("subCode"):
-        parts.append(f"Αντικείμενο {case['subCode']}")
-    kind = docket.get("courtKind") or ""
-    cat = docket.get("courtCategory") or ""
-    tail = " / ".join([p for p in (kind, cat) if p])
-    if tail:
-        parts.append(tail)
-    return " · ".join(parts) if parts else (kind or "—")
-
-
-def max_ts(docket: dict):
-    ts = []
-    for v in [docket.get("lastStatusTimestamp")] + [c.get("lastStatusTimestamp") for c in (docket.get("docketCases") or [])]:
-        if v:
-            try:
-                ts.append(datetime.fromisoformat(str(v).replace("Z", "+00:00")))
-            except Exception:
-                pass
-    return max(ts) if ts else None
-
-
-def analyze(docket: dict, entered_number: str) -> Optional[dict]:
-    cases = docket.get("docketCases") or []
-    target = None
-    for c in cases:
-        if case_number_matches(entered_number, c):
-            target = c
-            break
-    if target is None:
-        return None
-    my_serial = serial_val(target.get("serialNumber"))
-    tkey, tlabel = norm_status(target.get("status"), target.get("endReason"), target.get("result"))
-
-    remaining = 0
-    completed = 0
-    now_hearing = None
-    for c in cases:
-        k, _ = norm_status(c.get("status"), c.get("endReason"), c.get("result"))
-        if k in ("oloklirothike", "anavlithike"):
-            completed += 1
-        sv = serial_val(c.get("serialNumber"))
-        if sv < my_serial and k == "anamenetai":
-            remaining += 1
-        if k == "dikazetai":
-            if now_hearing is None or sv > serial_val(now_hearing.get("serialNumber")):
-                now_hearing = c
-
-    last_update = max_ts(docket)
-    started = last_update is not None or any(
-        norm_status(c.get("status"), c.get("endReason"), c.get("result"))[0] != "anamenetai" for c in cases)
-    stuck = False
-    if started and tkey == "anamenetai" and remaining > 0 and last_update is not None:
-        if datetime.now(timezone.utc) - last_update > timedelta(minutes=STUCK_MINUTES):
-            stuck = True
-
-    nh_serial = now_hearing.get("serialNumber") if now_hearing else None
-    nh_subject = case_subject(now_hearing, docket) if now_hearing else None
-
-    return {
-        "matched": True,
-        "docket_id": docket.get("id"),
-        "docket_code": docket.get("code"),
-        "building": docket.get("building"),
-        "room": docket.get("room"),
-        "court_name": docket.get("courtName"),
-        "court_kind": docket.get("courtKind"),
-        "court_category": docket.get("courtCategory"),
-        "target_serial": target.get("serialNumber"),
-        "my_subject": case_subject(target, docket),
-        "status_key": tkey,
-        "status_label": tlabel,
-        "remaining_ahead": remaining,
-        "completed_count": completed,
-        "total_cases": len(cases),
-        "now_hearing_serial": nh_serial,
-        "now_hearing_subject": nh_subject,
-        "started": started,
-        "stuck": stuck,
-        "docket_last_update": last_update.isoformat() if last_update else None,
-    }
+DOCKET_PAGE_SIZE = 50
+DOCKET_MAX_PAGES = 10
 
 
 async def resolve_case(tc: dict) -> dict:
-    """Fetch live state for one tracked case. Returns dict with feed_ok + analysis fields."""
+    """Fetch live state for one tracked case. Returns dict with feed_ok + analysis fields.
+
+    feed_ok is False whenever e-diki could not be read completely (listing or any docket
+    failed and the case was not found), so a silent outage is never mistaken for
+    "case not in the docket yet".
+    """
     params = {
         "courtType": tc["court_type"],
         "courtName": tc["court_name"],
@@ -420,21 +350,27 @@ async def resolve_case(tc: dict) -> dict:
         "courtCategory": tc.get("court_category"),
         "courtDateFrom": tc["court_date"],
         "courtDateTo": tc["court_date"],
-        "page": 0, "size": 50,
+        "size": DOCKET_PAGE_SIZE,
     }
-    listing = await ediki_get("/public/dockets", params)
-    if listing is None:
-        return {"feed_ok": False}
-    result = {"feed_ok": True, "matched": False}
-    for d in (listing.get("content") or []):
-        full = await ediki_get("/public/dockets", {"id": d["id"]})
-        if not full or not full.get("content"):
-            continue
-        analysis = analyze(full["content"][0], tc["case_number"])
-        if analysis:
-            result.update(analysis)
-            return result
-    return result
+    incomplete = False
+    for page in range(DOCKET_MAX_PAGES):
+        listing = await ediki_get("/public/dockets", {**params, "page": page})
+        if not isinstance(listing, dict):
+            return {"feed_ok": False}
+        content = listing.get("content") or []
+        for d in content:
+            full = await ediki_get("/public/dockets", {"id": d["id"]})
+            if not full or not full.get("content"):
+                incomplete = True
+                continue
+            analysis = analyze(full["content"][0], tc["case_number"], STUCK_MINUTES)
+            if analysis:
+                return {"feed_ok": True, **analysis}
+        total_pages = listing.get("totalPages")
+        if listing.get("last") is True or len(content) < DOCKET_PAGE_SIZE or \
+                (isinstance(total_pages, int) and page + 1 >= total_pages):
+            break
+    return {"feed_ok": not incomplete, "matched": False}
 
 
 # ----------------------------------------------------------------------------
@@ -458,30 +394,90 @@ def case_tag(tc: dict) -> str:
     return f"{tc.get('case_number')} · {tc.get('court_name')}"
 
 
+FEED_DOWN_AFTER = int(os.environ.get('FEED_DOWN_AFTER_CHECKS', '3'))
+ATHENS = ZoneInfo("Europe/Athens")
+_case_locks: dict = {}
+
+CARRY_FIELDS = ("docket_id", "docket_code", "building", "room", "court_kind", "court_category",
+                "target_serial", "my_subject", "status_key", "status_label", "remaining_ahead",
+                "paused_ahead", "finished_ahead", "postponed_ahead", "completed_count", "total_cases",
+                "now_hearing_serial", "now_hearing_subject", "started", "stuck", "docket_last_update")
+
+
+def _venue_lines(live: dict) -> List[str]:
+    return [f"Δικαστήριο: {live.get('court_name')} — {live.get('court_kind') or ''}",
+            f"Κτίριο/Αίθουσα: {live.get('building') or '-'} / {live.get('room') or '-'}"]
+
+
+def ahead_detail(live: dict) -> str:
+    """Why the number is what it is: held-back and postponed cases are visible to the lawyer."""
+    parts = [f"{live['remaining_ahead']} μπροστά σας"]
+    if live.get("paused_ahead"):
+        parts.append(f"εκ των οποίων {live['paused_ahead']} διακοπείσες/κρατημένες")
+    if live.get("postponed_ahead"):
+        parts.append(f"{live['postponed_ahead']} αναβλήθηκαν")
+    if live.get("finished_ahead"):
+        parts.append(f"{live['finished_ahead']} ολοκληρώθηκαν")
+    return ", ".join(parts)
+
+
+def _is_court_day(tc: dict) -> bool:
+    return tc.get("court_date") == datetime.now(ATHENS).date().isoformat()
+
+
 async def evaluate_case(tc: dict):
+    """Serialise checks per case (monitor loop vs. manual refresh) and work on fresh data,
+    so one change never produces two notifications."""
+    lock = _case_locks.setdefault(tc["id"], asyncio.Lock())
+    async with lock:
+        fresh = await db.tracked_cases.find_one({"id": tc["id"]})
+        if fresh:
+            await _evaluate_locked(fresh)
+
+
+async def _evaluate_locked(tc: dict):
     live = await resolve_case(tc)
     now_iso = datetime.now(timezone.utc).isoformat()
     update = {"last_checked": now_iso, "feed_ok": live.get("feed_ok", False)}
+    notes = []
+    alerts = []
 
+    # --- e-diki unreachable: never fail silently on the day of the hearing -------------
     if not live.get("feed_ok"):
-        update["feed_ok"] = False
+        fails = (tc.get("feed_fail_count") or 0) + 1
+        update["feed_fail_count"] = fails
+        if (fails >= FEED_DOWN_AFTER and not tc.get("notified_feed_down") and _is_court_day(tc)
+                and tc.get("status_key") not in ("oloklirothike", "anavlithike")):
+            title = "Το e-diki δεν ανταποκρίνεται"
+            msg = (f"Δεν μπορούμε να διαβάσουμε το πινάκιο εδώ και {fails} συνεχόμενους ελέγχους "
+                   f"({case_tag(tc)}). Μέχρι να αποκατασταθεί δεν θα λαμβάνετε ενημερώσεις· "
+                   f"παρακολουθήστε το πινάκιο χειροκίνητα.")
+            notes.append(("feed_down", title, msg))
+            alerts.append((title, [msg], f"Προσοχή: το e-diki δεν ανταποκρίνεται. Παρακολουθήστε το πινάκιο "
+                                         f"χειροκίνητα για την υπόθεση {tc.get('case_number')}.", True))
+            update["notified_feed_down"] = True
         await db.tracked_cases.update_one({"id": tc["id"]}, {"$set": update})
+        await _emit(tc, notes, alerts)
         return
+
+    update["feed_fail_count"] = 0
+    if tc.get("notified_feed_down"):
+        notes.append(("feed_restored", "Το e-diki ανταποκρίνεται ξανά",
+                      f"Η παρακολούθηση της υπόθεσης {case_tag(tc)} συνεχίζεται κανονικά."))
+        update["notified_feed_down"] = False
 
     update["matched"] = live.get("matched", False)
     if not live.get("matched"):
         await db.tracked_cases.update_one({"id": tc["id"]}, {"$set": update})
+        await _emit(tc, notes, alerts)
         return
 
-    for f in ("docket_id", "docket_code", "building", "room", "court_kind", "court_category",
-              "target_serial", "my_subject", "status_key", "status_label", "remaining_ahead",
-              "completed_count", "total_cases", "now_hearing_serial", "now_hearing_subject",
-              "started", "stuck", "docket_last_update"):
+    for f in CARRY_FIELDS:
         update[f] = live.get(f)
 
     threshold = tc.get("threshold", 5)
-    notes = []
-    alerts = []
+    remaining = live["remaining_ahead"]
+    waiting = live["status_key"] in ("anamenetai", "diakopike")
 
     # 1. status change of my case
     prev_status = tc.get("status_key")
@@ -490,35 +486,40 @@ async def evaluate_case(tc: dict):
         msg = f"Η υπόθεση {case_tag(tc)} (σειρά #{live.get('target_serial')}) είναι πλέον: {live['status_label']}."
         notes.append(("status_change", title, msg))
         if live["status_key"] in ("dikazetai", "oloklirothike", "anavlithike"):
-            alerts.append((title, [msg,
-                                   f"Δικαστήριο: {live.get('court_name')} — {live.get('court_kind') or ''}",
-                                   f"Κτίριο/Αίθουσα: {live.get('building') or '-'} / {live.get('room') or '-'}"],
-                           f"Η υπόθεση {tc.get('case_number')} είναι πλέον: {live['status_label']}."))
+            alerts.append((title, [msg, *_venue_lines(live)],
+                           f"Η υπόθεση {tc.get('case_number')} είναι πλέον: {live['status_label']}.", True))
 
-    # 2. approaching its turn
-    if (live["status_key"] == "anamenetai" and live.get("started")
-            and live["remaining_ahead"] <= threshold and not tc.get("notified_approaching")):
+    # 2. approaching its turn (first time within the threshold)
+    if waiting and live.get("started") and remaining <= threshold and not tc.get("notified_approaching"):
         title = "Η υπόθεσή σας πλησιάζει!"
-        msg = (f"Απομένουν {live['remaining_ahead']} υποθέσεις πριν από τη δική σας "
+        msg = (f"Απομένουν {remaining} υποθέσεις πριν από τη δική σας "
                f"({case_tag(tc)}, σειρά #{live.get('target_serial')}). "
-               f"Τώρα δικάζεται η σειρά #{live.get('now_hearing_serial') or '—'}.")
+               f"Τώρα δικάζεται η σειρά #{live.get('now_hearing_serial') or '—'}. ({ahead_detail(live)})")
         notes.append(("approaching", title, msg))
-        alerts.append((title, [msg,
-                               f"Δικαστήριο: {live.get('court_name')} — {live.get('court_kind') or ''}",
-                               f"Κτίριο/Αίθουσα: {live.get('building') or '-'} / {live.get('room') or '-'}"],
-                       f"Προσοχή! Απομένουν {live['remaining_ahead']} υποθέσεις πριν από τη δική σας, "
-                       f"αριθμός {tc.get('case_number')}, σειρά {live.get('target_serial')}."))
+        alerts.append((title, [msg, *_venue_lines(live)],
+                       f"Προσοχή! Απομένουν {remaining} υποθέσεις πριν από τη δική σας, "
+                       f"αριθμός {tc.get('case_number')}, σειρά {live.get('target_serial')}.", True))
         update["notified_approaching"] = True
-    if live["remaining_ahead"] > threshold:
+    elif (waiting and live.get("started") and tc.get("notified_approaching") and remaining <= threshold
+          and tc.get("remaining_ahead") is not None and remaining != tc.get("remaining_ahead")):
+        # 2b. already inside the threshold: tell the lawyer every time the count moves
+        # (a case finished, was postponed, or a held-back case came back).
+        title = f"Απομένουν {remaining} υποθέσεις"
+        msg = (f"Η υπόθεσή σας {case_tag(tc)} (σειρά #{live.get('target_serial')}): "
+               f"από {tc.get('remaining_ahead')} → {remaining} υποθέσεις μπροστά. ({ahead_detail(live)})")
+        notes.append(("progress", title, msg))
+        alerts.append((title, [msg, *_venue_lines(live)],
+                       f"Υπόθεση {tc.get('case_number')}: απομένουν {remaining} μπροστά σας.", False))
+    if remaining > threshold:
         update["notified_approaching"] = False
 
     # 3. now-hearing serial changed (in-app only)
     if (live.get("now_hearing_serial") and live.get("now_hearing_serial") != tc.get("now_hearing_serial")
-            and live.get("started")):
+            and live.get("started") and not any(n[0] == "progress" for n in notes)):
         notes.append(("progress", "Πρόοδος πινακίου",
                       f"Τώρα δικάζεται η σειρά #{live['now_hearing_serial']}"
                       f"{(' — ' + live['now_hearing_subject']) if live.get('now_hearing_subject') else ''}. "
-                      f"Για την υπόθεσή σας (#{live.get('target_serial')}) απομένουν {live['remaining_ahead']}."))
+                      f"Για την υπόθεσή σας (#{live.get('target_serial')}): {ahead_detail(live)}."))
 
     # 4. stuck docket
     if live.get("stuck") and not tc.get("notified_stuck"):
@@ -529,20 +530,23 @@ async def evaluate_case(tc: dict):
         notes.append(("stuck", title, msg))
         alerts.append((title, [msg],
                        f"Προσοχή: το πινάκιο στο {live.get('court_name')} φαίνεται στάσιμο "
-                       f"ενώ η υπόθεσή σας αναμένεται ακόμη."))
+                       f"ενώ η υπόθεσή σας αναμένεται ακόμη.", True))
         update["notified_stuck"] = True
     if not live.get("stuck"):
         update["notified_stuck"] = False
 
-    update["status_key"] = live["status_key"]
     if live["status_key"] in ("oloklirothike", "anavlithike"):
         update["active"] = False
 
     await db.tracked_cases.update_one({"id": tc["id"]}, {"$set": update})
+    await _emit(tc, notes, alerts)
+
+
+async def _emit(tc: dict, notes: list, alerts: list):
     for ntype, title, msg in notes:
         await create_notification(tc, ntype, title, msg)
-    for subject, lines, short in alerts:
-        await dispatch_alert(tc, subject, lines, short)
+    for subject, lines, short, voice in alerts:
+        await dispatch_alert(tc, subject, lines, short, voice=voice)
 
 
 async def monitor_loop():
@@ -574,19 +578,49 @@ class LoginIn(BaseModel):
     password: str
 
 
+CHANNELS = ("email", "sms", "call")
+
+
 class TrackIn(BaseModel):
     court_type: str
     court_name: str
     court_kind: Optional[str] = None
     court_category: Optional[str] = None
-    court_date: str
-    case_number: str
+    court_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    case_number: str = Field(min_length=1, max_length=64)
     notify_email: Optional[EmailStr] = None
     notify_channels: List[str] = ["email"]
     phone: Optional[str] = None
-    threshold: int = 5
+    threshold: int = Field(default=5, ge=1, le=50)
     group_id: Optional[str] = None
-    label: Optional[str] = None
+    label: Optional[str] = Field(default=None, max_length=120)
+
+    @field_validator("notify_channels")
+    @classmethod
+    def _channels(cls, v: List[str]) -> List[str]:
+        v = list(dict.fromkeys(v or ["email"]))
+        bad = [c for c in v if c not in CHANNELS]
+        if bad:
+            raise ValueError(f"Μη έγκυρο κανάλι ειδοποίησης: {', '.join(bad)}")
+        return v
+
+    @field_validator("phone")
+    @classmethod
+    def _phone(cls, v: Optional[str]) -> Optional[str]:
+        if not v or not v.strip():
+            return None
+        num = _to_e164(v)
+        if not num or not re.fullmatch(r"\+\d{8,15}", num):
+            raise ValueError("Μη έγκυρος αριθμός τηλεφώνου")
+        return num
+
+    @model_validator(mode="after")
+    def _channel_requirements(self):
+        if "email" in self.notify_channels and not self.notify_email:
+            raise ValueError("Απαιτείται email για ειδοποίηση μέσω email")
+        if ({"sms", "call"} & set(self.notify_channels)) and not self.phone:
+            raise ValueError("Απαιτείται αριθμός τηλεφώνου για SMS ή κλήση")
+        return self
 
 
 class GroupIn(BaseModel):
@@ -647,25 +681,144 @@ async def court_types():
 
 @api.get("/ediki/court-names")
 async def court_names(courtType: str, date: Optional[str] = None):
-    data = await ediki_get("/public/dockets/courtNames",
-                           {"courtType": courtType, "courtDateFrom": date, "courtDateTo": date})
-    return data or []
+    return await ediki_options("/public/dockets/courtNames", {"courtType": courtType}, date)
 
 
 @api.get("/ediki/court-kinds")
 async def court_kinds(courtType: str, courtName: str, date: Optional[str] = None):
-    data = await ediki_get("/public/dockets/courtKinds",
-                           {"courtType": courtType, "courtName": courtName,
-                            "courtDateFrom": date, "courtDateTo": date})
-    return data or []
+    return await ediki_options("/public/dockets/courtKinds",
+                               {"courtType": courtType, "courtName": courtName}, date)
 
 
 @api.get("/ediki/court-categories")
 async def court_categories(courtType: str, courtName: str, courtKind: Optional[str] = None, date: Optional[str] = None):
-    data = await ediki_get("/public/dockets/courtCategories",
-                           {"courtType": courtType, "courtName": courtName, "courtKind": courtKind,
-                            "courtDateFrom": date, "courtDateTo": date})
-    return data or []
+    return await ediki_options("/public/dockets/courtCategories",
+                               {"courtType": courtType, "courtName": courtName, "courtKind": courtKind}, date)
+
+
+# ----------------------------------------------------------------------------
+# Contact verification (OTP): alerts only go to an email/phone the user has proven they own
+# ----------------------------------------------------------------------------
+CODE_TTL_MIN = 10
+CODE_MAX_ATTEMPTS = 5
+CODE_COOLDOWN_S = 60          # between codes for the same user + contact
+CODE_PER_USER_HOUR = 5        # codes one account may request per hour
+CODE_PER_CONTACT_DAY = 3      # codes any accounts may trigger towards one contact per day
+_email_adapter = TypeAdapter(EmailStr)
+
+
+class ContactIn(BaseModel):
+    kind: Literal["email", "phone"]
+    value: str = Field(min_length=3, max_length=254)
+
+
+class ContactVerifyIn(ContactIn):
+    code: str = Field(min_length=4, max_length=10)
+
+
+def normalize_contact(kind: str, value: str) -> str:
+    value = (value or "").strip()
+    if kind == "email":
+        try:
+            return str(_email_adapter.validate_python(value)).lower()
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Μη έγκυρο email")
+    num = _to_e164(value)
+    if not num or not re.fullmatch(r"\+\d{8,15}", num):
+        raise HTTPException(status_code=422, detail="Μη έγκυρος αριθμός τηλεφώνου")
+    return num
+
+
+def _code_hash(challenge_id: str, code: str) -> str:
+    return hmac.new(JWT_SECRET.encode(), f"{challenge_id}:{code}".encode(), hashlib.sha256).hexdigest()
+
+
+async def is_verified(user_id: str, kind: str, value: str) -> bool:
+    return bool(await db.verified_contacts.find_one({"user_id": user_id, "kind": kind, "value": value}))
+
+
+async def _send_code(kind: str, value: str, code: str) -> bool:
+    if kind == "email":
+        subject = "Κωδικός επαλήθευσης"
+        lines = [f"Ο κωδικός επαλήθευσης είναι: {code}",
+                 f"Ισχύει για {CODE_TTL_MIN} λεπτά. Αν δεν τον ζητήσατε εσείς, αγνοήστε αυτό το μήνυμα."]
+        try:
+            return bool(await send_email(to=value, subject=f"[e-dikiΜου] {subject}",
+                                         html=build_alert_html(subject, lines)))
+        except ValueError:
+            return False
+    return await asyncio.to_thread(send_sms, value, f"e-dikiΜου: κωδικός επαλήθευσης {code} (ισχύει {CODE_TTL_MIN}')")
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+@api.post("/contacts/request")
+async def request_contact_code(body: ContactIn, user=Depends(get_current_user)):
+    value = normalize_contact(body.kind, body.value)
+    if await is_verified(user["id"], body.kind, value):
+        return {"ok": True, "already_verified": True, "value": value}
+
+    now = datetime.now(timezone.utc)
+    mine = {"user_id": user["id"], "kind": body.kind, "value": value}
+    last = await db.contact_challenges.find_one(mine, sort=[("created_at", -1)])
+    if last and last["created_at"] > _iso(now - timedelta(seconds=CODE_COOLDOWN_S)):
+        raise HTTPException(status_code=429, detail="Περιμένετε λίγο πριν ζητήσετε νέο κωδικό")
+    if await db.contact_challenges.count_documents(
+            {"user_id": user["id"], "created_at": {"$gte": _iso(now - timedelta(hours=1))}}) >= CODE_PER_USER_HOUR:
+        raise HTTPException(status_code=429, detail="Πολλά αιτήματα κωδικού. Δοκιμάστε αργότερα")
+    if await db.contact_challenges.count_documents(
+            {"kind": body.kind, "value": value,
+             "created_at": {"$gte": _iso(now - timedelta(days=1))}}) >= CODE_PER_CONTACT_DAY:
+        raise HTTPException(status_code=429, detail="Έχουν σταλεί ήδη πολλοί κωδικοί σε αυτή τη διεύθυνση/αριθμό")
+
+    code = f"{secrets.randbelow(10 ** 6):06d}"
+    cid = str(uuid.uuid4())
+    await db.contact_challenges.insert_one({
+        **mine, "id": cid, "code_hash": _code_hash(cid, code), "attempts": 0, "used": False,
+        "expires_at": _iso(now + timedelta(minutes=CODE_TTL_MIN)), "created_at": _iso(now)})
+    if not await _send_code(body.kind, value, code):
+        await db.contact_challenges.delete_one({"id": cid})
+        raise HTTPException(status_code=503, detail="Δεν ήταν δυνατή η αποστολή κωδικού αυτή τη στιγμή")
+    return {"ok": True, "value": value, "expires_in": CODE_TTL_MIN * 60}
+
+
+@api.post("/contacts/verify")
+async def verify_contact(body: ContactVerifyIn, user=Depends(get_current_user)):
+    value = normalize_contact(body.kind, body.value)
+    ch = await db.contact_challenges.find_one(
+        {"user_id": user["id"], "kind": body.kind, "value": value}, sort=[("created_at", -1)])
+    now = _iso(datetime.now(timezone.utc))
+    if not ch or ch.get("used") or ch["expires_at"] < now:
+        raise HTTPException(status_code=400, detail="Ο κωδικός έληξε ή δεν υπάρχει. Ζητήστε νέο")
+    if ch["attempts"] >= CODE_MAX_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="Πολλές αποτυχημένες προσπάθειες. Ζητήστε νέο κωδικό")
+    if not hmac.compare_digest(ch["code_hash"], _code_hash(ch["id"], body.code.strip())):
+        await db.contact_challenges.update_one({"id": ch["id"]}, {"$inc": {"attempts": 1}})
+        raise HTTPException(status_code=400, detail="Λάθος κωδικός")
+    await db.contact_challenges.update_one({"id": ch["id"]}, {"$set": {"used": True}})
+    await db.verified_contacts.update_one(
+        {"user_id": user["id"], "kind": body.kind, "value": value},
+        {"$set": {"verified_at": now}}, upsert=True)
+    return {"ok": True, "value": value}
+
+
+@api.get("/contacts")
+async def list_contacts(user=Depends(get_current_user)):
+    docs = await db.verified_contacts.find({"user_id": user["id"]}).to_list(50)
+    return [{"kind": d["kind"], "value": d["value"]} for d in docs]
+
+
+async def require_verified_contacts(user_id: str, body: "TrackIn") -> None:
+    needed = []
+    if "email" in body.notify_channels and body.notify_email:
+        needed.append(("email", str(body.notify_email).lower(), "Το email"))
+    if ({"sms", "call"} & set(body.notify_channels)) and body.phone:
+        needed.append(("phone", body.phone, "Το τηλέφωνο"))
+    for kind, value, label in needed:
+        if not await is_verified(user_id, kind, value):
+            raise HTTPException(status_code=400, detail=f"{label} δεν έχει επαληθευτεί. Επαληθεύστε το πριν προχωρήσετε")
 
 
 # ----------------------------------------------------------------------------
@@ -685,6 +838,7 @@ async def user_group_ids(user) -> List[str]:
 async def add_case(body: TrackIn, user=Depends(get_current_user)):
     if body.group_id and body.group_id not in await user_group_ids(user):
         raise HTTPException(status_code=403, detail="Δεν ανήκετε σε αυτή την ομάδα")
+    await require_verified_contacts(user["id"], body)
     tc = {
         "id": str(uuid.uuid4()),
         "user_id": user["id"],
@@ -697,13 +851,14 @@ async def add_case(body: TrackIn, user=Depends(get_current_user)):
         "court_date": body.court_date,
         "case_number": body.case_number.strip(),
         "notify_email": body.notify_email.lower() if body.notify_email else None,
-        "notify_channels": body.notify_channels or ["email"],
-        "phone": body.phone.strip() if body.phone else None,
+        "notify_channels": body.notify_channels,
+        "phone": body.phone,
         "threshold": body.threshold,
         "active": True,
         "feed_ok": None, "matched": None, "status_key": None, "status_label": None,
         "remaining_ahead": None, "now_hearing_serial": None, "now_hearing_subject": None,
         "notified_approaching": False, "notified_stuck": False,
+        "notified_feed_down": False, "feed_fail_count": 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.tracked_cases.insert_one(dict(tc))
@@ -748,6 +903,7 @@ async def delete_case(case_id: str, user=Depends(get_current_user)):
     if tc["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Μόνο ο δημιουργός μπορεί να διαγράψει")
     await db.tracked_cases.delete_one({"id": case_id})
+    _case_locks.pop(case_id, None)
     await db.notifications.delete_many({"tracked_case_id": case_id})
     return {"ok": True}
 
@@ -835,6 +991,9 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     await db.users.create_index("email", unique=True)
+    await db.verified_contacts.create_index([("user_id", 1), ("kind", 1), ("value", 1)], unique=True)
+    await db.contact_challenges.create_index([("user_id", 1), ("kind", 1), ("value", 1), ("created_at", -1)])
+    await db.contact_challenges.create_index("created_at")
     await db.tracked_cases.create_index("id", unique=True)
     await db.notifications.create_index("id", unique=True)
     asyncio.create_task(monitor_loop())
@@ -843,4 +1002,6 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    if _http is not None:
+        await _http.aclose()
     client.close()
