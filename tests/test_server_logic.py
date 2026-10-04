@@ -94,7 +94,7 @@ def run_checks(monkeypatch, doc, results):
     sent = []
     it = iter(results)
 
-    async def fake_resolve(tc):
+    async def fake_resolve(tc, fetched=None):
         return next(it)
 
     async def fake_dispatch(tc, subject, lines, short, voice=True):

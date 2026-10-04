@@ -13,6 +13,7 @@ import secrets
 import re
 import uuid
 import ipaddress
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from html import escape
 from html.parser import HTMLParser
@@ -288,6 +289,8 @@ async def dispatch_alert(tc: dict, subject: str, lines: List[str], short_text: s
 # e-diki client + status logic
 # ----------------------------------------------------------------------------
 _http: Optional[httpx.AsyncClient] = None
+EDIKI_CONCURRENCY = int(os.environ.get('EDIKI_CONCURRENCY', '6'))
+_ediki_sem: Optional[asyncio.Semaphore] = None
 
 
 def _client() -> httpx.AsyncClient:
@@ -299,9 +302,13 @@ def _client() -> httpx.AsyncClient:
 
 
 async def ediki_get(path: str, params: dict) -> Optional[object]:
+    global _ediki_sem
+    if _ediki_sem is None:   # global cap on simultaneous requests, however many checks run at once
+        _ediki_sem = asyncio.Semaphore(EDIKI_CONCURRENCY)
     try:
-        r = await _client().get(f"{EDIKI_BASE}{path}",
-                                params={k: v for k, v in params.items() if v not in (None, "")})
+        async with _ediki_sem:
+            r = await _client().get(f"{EDIKI_BASE}{path}",
+                                    params={k: v for k, v in params.items() if v not in (None, "")})
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -336,16 +343,26 @@ async def ediki_options(path: str, params: dict, date: Optional[str] = None) -> 
 
 DOCKET_PAGE_SIZE = 50
 DOCKET_MAX_PAGES = 10
+DOCKET_CACHE_TTL = int(os.environ.get('DOCKET_CACHE_TTL_SECONDS', '15'))
 
 
-async def resolve_case(tc: dict) -> dict:
-    """Fetch live state for one tracked case. Returns dict with feed_ok + analysis fields.
+@dataclass
+class DocketFetch:
+    """Every docket matching one court query. ok=False: listing unreadable.
+    incomplete=True: some docket detail could not be read, so a miss proves nothing."""
+    dockets: list = field(default_factory=list)
+    ok: bool = True
+    incomplete: bool = False
 
-    feed_ok is False whenever e-diki could not be read completely (listing or any docket
-    failed and the case was not found), so a silent outage is never mistaken for
-    "case not in the docket yet".
-    """
-    params = {
+
+def group_key(tc: dict) -> tuple:
+    """Cases sharing this key read exactly the same dockets, so they share one fetch."""
+    return (tc.get("court_type"), tc.get("court_name"), tc.get("court_kind"),
+            tc.get("court_category"), tc.get("court_date"))
+
+
+def docket_query(tc: dict) -> dict:
+    return {
         "courtType": tc["court_type"],
         "courtName": tc["court_name"],
         "courtKind": tc.get("court_kind"),
@@ -354,25 +371,65 @@ async def resolve_case(tc: dict) -> dict:
         "courtDateTo": tc["court_date"],
         "size": DOCKET_PAGE_SIZE,
     }
-    incomplete = False
+
+
+async def fetch_dockets(params: dict) -> DocketFetch:
+    result = DocketFetch()
     for page in range(DOCKET_MAX_PAGES):
         listing = await ediki_get("/public/dockets", {**params, "page": page})
         if not isinstance(listing, dict):
-            return {"feed_ok": False}
+            return DocketFetch(ok=False)
         content = listing.get("content") or []
-        for d in content:
-            full = await ediki_get("/public/dockets", {"id": d["id"]})
-            if not full or not full.get("content"):
-                incomplete = True
-                continue
-            analysis = analyze(full["content"][0], tc["case_number"], STUCK_MINUTES)
-            if analysis:
-                return {"feed_ok": True, **analysis}
+        fulls = await asyncio.gather(*(ediki_get("/public/dockets", {"id": d["id"]}) for d in content))
+        for full in fulls:
+            if isinstance(full, dict) and full.get("content"):
+                result.dockets.append(full["content"][0])
+            else:
+                result.incomplete = True
         total_pages = listing.get("totalPages")
         if listing.get("last") is True or len(content) < DOCKET_PAGE_SIZE or \
                 (isinstance(total_pages, int) and page + 1 >= total_pages):
             break
-    return {"feed_ok": not incomplete, "matched": False}
+    return result
+
+
+_docket_cache: dict = {}
+_docket_locks: dict = {}
+
+
+async def get_dockets(tc: dict, force: bool = False) -> DocketFetch:
+    """Fetch a case's dockets, sharing the result with concurrent and near-simultaneous callers
+    (several lawyers on the same hearing, the monitor plus a manual refresh)."""
+    key = group_key(tc)
+    lock = _docket_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        now = datetime.now(timezone.utc).timestamp()
+        hit = _docket_cache.get(key)
+        if hit and not force and hit[0] > now:
+            return hit[1]
+        res = await fetch_dockets(docket_query(tc))
+        if res.ok:   # failures are never cached, so the next check retries immediately
+            _docket_cache[key] = (now + DOCKET_CACHE_TTL, res)
+        else:
+            _docket_cache.pop(key, None)
+        return res
+
+
+async def resolve_case(tc: dict, fetched: Optional[DocketFetch] = None) -> dict:
+    """Live state for one tracked case. Returns dict with feed_ok + analysis fields.
+
+    feed_ok is False whenever e-diki could not be read completely (listing unreadable, or a
+    docket failed and the case was not found), so a silent outage is never mistaken for
+    "case not in the docket yet".
+    """
+    res = fetched if fetched is not None else await get_dockets(tc)
+    if not res.ok:
+        return {"feed_ok": False}
+    for docket in res.dockets:
+        analysis = analyze(docket, tc["case_number"], STUCK_MINUTES)
+        if analysis:
+            return {"feed_ok": True, **analysis}
+    return {"feed_ok": not res.incomplete, "matched": False}
 
 
 # ----------------------------------------------------------------------------
@@ -427,18 +484,18 @@ def _is_court_day(tc: dict) -> bool:
     return tc.get("court_date") == datetime.now(ATHENS).date().isoformat()
 
 
-async def evaluate_case(tc: dict):
+async def evaluate_case(tc: dict, fetched: Optional[DocketFetch] = None):
     """Serialise checks per case (monitor loop vs. manual refresh) and work on fresh data,
     so one change never produces two notifications."""
     lock = _case_locks.setdefault(tc["id"], asyncio.Lock())
     async with lock:
         fresh = await db.tracked_cases.find_one({"id": tc["id"]})
         if fresh:
-            await _evaluate_locked(fresh)
+            await _evaluate_locked(fresh, fetched)
 
 
-async def _evaluate_locked(tc: dict):
-    live = await resolve_case(tc)
+async def _evaluate_locked(tc: dict, fetched: Optional[DocketFetch] = None):
+    live = await resolve_case(tc, fetched)
     now_iso = datetime.now(timezone.utc).isoformat()
     update = {"last_checked": now_iso, "feed_ok": live.get("feed_ok", False)}
     notes = []
@@ -551,19 +608,62 @@ async def _emit(tc: dict, notes: list, alerts: list):
         await dispatch_alert(tc, subject, lines, short, voice=voice)
 
 
+FUTURE_CHECK_MINUTES = int(os.environ.get('FUTURE_CHECK_MINUTES', '30'))
+
+
+def _today_athens() -> str:
+    return datetime.now(ATHENS).date().isoformat()
+
+
+async def monitor_tick():
+    """One pass over all active cases.
+
+    - hearings in the past are retired (they would otherwise be polled forever);
+    - hearings on a later day are only re-checked every FUTURE_CHECK_MINUTES;
+    - the rest are grouped by court query: each group reads e-diki once and every case in
+      it is evaluated against that single result, groups running concurrently (the global
+      semaphore in ediki_get bounds the real request rate).
+    """
+    today = _today_athens()
+    now = datetime.now(timezone.utc)
+    future_gap = (now - timedelta(minutes=FUTURE_CHECK_MINUTES)).isoformat()
+    groups: dict = {}
+    for tc in await db.tracked_cases.find({"active": True}).to_list(None):
+        day = tc.get("court_date") or ""
+        if day < today:
+            await db.tracked_cases.update_one({"id": tc["id"]}, {"$set": {"active": False, "expired": True}})
+            continue
+        if day > today and (tc.get("last_checked") or "") > future_gap:
+            continue
+        groups.setdefault(group_key(tc), []).append(tc)
+
+    async def run_group(tcs: list):
+        try:
+            fetched = await get_dockets(tcs[0], force=True)
+        except Exception as e:
+            logger.error(f"docket fetch error {group_key(tcs[0])}: {e}")
+            fetched = DocketFetch(ok=False)
+        for tc in tcs:
+            try:
+                await evaluate_case(tc, fetched)
+            except Exception as e:   # one bad case must not stop the others
+                logger.error(f"evaluate_case error {tc.get('id')}: {e}")
+
+    await asyncio.gather(*(run_group(g) for g in groups.values()))
+    return {"cases": sum(len(g) for g in groups.values()), "groups": len(groups)}
+
+
 async def monitor_loop():
     await asyncio.sleep(5)
     while True:
+        started = asyncio.get_running_loop().time()
         try:
-            cases = await db.tracked_cases.find({"active": True}).to_list(1000)
-            for tc in cases:
-                try:
-                    await evaluate_case(tc)
-                except Exception as e:
-                    logger.error(f"evaluate_case error {tc.get('id')}: {e}")
+            stats = await monitor_tick()
+            logger.info("monitor tick: %s cases in %s dockets queries", stats["cases"], stats["groups"])
         except Exception as e:
             logger.error(f"monitor loop error: {e}")
-        await asyncio.sleep(MONITOR_INTERVAL)
+        # fixed cadence: a slow pass shortens the pause instead of stretching the interval
+        await asyncio.sleep(max(1.0, MONITOR_INTERVAL - (asyncio.get_running_loop().time() - started)))
 
 
 # ----------------------------------------------------------------------------
@@ -1075,12 +1175,15 @@ async def startup():
         logger.error(f"could not create unique index on groups.code: {e}")
     await db.tracked_cases.create_index("id", unique=True)
     await db.notifications.create_index("id", unique=True)
-    asyncio.create_task(monitor_loop())
+    app.state.monitor_task = asyncio.create_task(monitor_loop())
     logger.info("e-dikiΜου started; monitor interval=%ss", MONITOR_INTERVAL)
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    task = getattr(app.state, "monitor_task", None)
+    if task:
+        task.cancel()
     if _http is not None:
         await _http.aclose()
     client.close()

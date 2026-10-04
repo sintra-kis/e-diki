@@ -27,3 +27,10 @@ Web app "e-dikiΜου" (Greek UI) for lawyers to track court cause lists (πιν
 - Richer offense/subject detail via getCaseDetailsPublic where available.
 - Per-case notification history view & email open tracking.
 - Group management (leave group, remove member, rename).
+
+## Monitoring (updated)
+- Each pass groups active cases by court query (type, κατάστημα, δικαστήριο, διαδικασία, date): one read of e-diki per group, every case evaluated against that result; groups run concurrently, global request cap `EDIKI_CONCURRENCY` (6).
+- Results are cached `DOCKET_CACHE_TTL_SECONDS` (15) so a manual refresh or a late-added case reuses a fresh read; failures are never cached.
+- Past hearings are retired (`active=false, expired=true`); later-day hearings are re-checked every `FUTURE_CHECK_MINUTES` (30).
+- Fixed cadence `MONITOR_INTERVAL_SECONDS` (120) measured start-to-start.
+- `TRUST_PROXY=1` makes rate limiting use X-Forwarded-For (only behind a proxy that overwrites it).
