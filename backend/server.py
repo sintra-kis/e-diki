@@ -24,6 +24,8 @@ import bcrypt
 import jwt
 import httpx
 from bson import ObjectId
+from bson.errors import InvalidId
+from pymongo.errors import DuplicateKeyError, OperationFailure
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -106,7 +108,7 @@ async def get_current_user(request: Request) -> dict:
         return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Η συνεδρία έληξε")
-    except jwt.InvalidTokenError:
+    except (jwt.InvalidTokenError, InvalidId, KeyError, TypeError):
         raise HTTPException(status_code=401, detail="Μη έγκυρο token")
 
 
@@ -568,9 +570,9 @@ async def monitor_loop():
 # Pydantic models
 # ----------------------------------------------------------------------------
 class RegisterIn(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=100)
     email: EmailStr
-    password: str = Field(min_length=6)
+    password: str = Field(min_length=6, max_length=128)
 
 
 class LoginIn(BaseModel):
@@ -624,18 +626,55 @@ class TrackIn(BaseModel):
 
 
 class GroupIn(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=80)
 
 
 class JoinGroupIn(BaseModel):
-    code: str
+    code: str = Field(min_length=1, max_length=32)
 
 
 # ----------------------------------------------------------------------------
 # Auth routes
 # ----------------------------------------------------------------------------
+# Failed-attempt limiter kept in the database so it holds across workers/restarts.
+AUTH_WINDOW_MIN = 15
+LOGIN_FAILS_PER_EMAIL = 5
+LOGIN_FAILS_PER_IP = 20
+REGISTER_PER_IP_HOUR = 10
+JOIN_FAILS_PER_USER_HOUR = 10
+_DUMMY_HASH = bcrypt.hashpw(b"timing-equaliser", bcrypt.gensalt()).decode()
+
+
+def client_ip(request: Request) -> str:
+    """Behind a reverse proxy set TRUST_PROXY=1 (the proxy must overwrite X-Forwarded-For)."""
+    if os.environ.get("TRUST_PROXY") == "1":
+        fwd = request.headers.get("x-forwarded-for", "")
+        if fwd:
+            return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+async def attempts_since(key: str, window: timedelta) -> int:
+    since = (datetime.now(timezone.utc) - window).isoformat()
+    return await db.auth_attempts.count_documents({"key": key, "created_at": {"$gte": since}})
+
+
+async def record_attempt(key: str) -> None:
+    now = datetime.now(timezone.utc)
+    await db.auth_attempts.insert_one({"key": key, "created_at": now.isoformat(),
+                                       "ttl": now + timedelta(days=1)})   # TTL index removes old rows
+
+
+def too_many(detail: str = "Πολλές προσπάθειες. Δοκιμάστε ξανά αργότερα") -> HTTPException:
+    return HTTPException(status_code=429, detail=detail, headers={"Retry-After": str(AUTH_WINDOW_MIN * 60)})
+
+
 @api.post("/auth/register")
-async def register(body: RegisterIn):
+async def register(body: RegisterIn, request: Request):
+    ip_key = f"register:ip:{client_ip(request)}"
+    if await attempts_since(ip_key, timedelta(hours=1)) >= REGISTER_PER_IP_HOUR:
+        raise too_many("Πολλές εγγραφές από αυτή τη διεύθυνση. Δοκιμάστε αργότερα")
+    await record_attempt(ip_key)
     email = body.email.lower()
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Το email χρησιμοποιείται ήδη")
@@ -648,11 +687,21 @@ async def register(body: RegisterIn):
 
 
 @api.post("/auth/login")
-async def login(body: LoginIn):
+async def login(body: LoginIn, request: Request):
     email = body.email.lower()
+    email_key, ip_key = f"login:email:{email}", f"login:ip:{client_ip(request)}"
+    window = timedelta(minutes=AUTH_WINDOW_MIN)
+    if (await attempts_since(email_key, window) >= LOGIN_FAILS_PER_EMAIL
+            or await attempts_since(ip_key, window) >= LOGIN_FAILS_PER_IP):
+        raise too_many("Πάρα πολλές αποτυχημένες προσπάθειες σύνδεσης. Δοκιμάστε ξανά σε λίγα λεπτά")
     user = await db.users.find_one({"email": email})
-    if not user or not verify_password(body.password, user["password_hash"]):
+    # always run one bcrypt check so response time doesn't reveal whether the email exists
+    ok = verify_password(body.password, user["password_hash"] if user else _DUMMY_HASH) and bool(user)
+    if not ok:
+        await record_attempt(email_key)
+        await record_attempt(ip_key)
         raise HTTPException(status_code=401, detail="Λάθος email ή κωδικός")
+    await db.auth_attempts.delete_many({"key": email_key})
     uid = str(user["_id"])
     return {"access_token": create_access_token(uid, email),
             "user": {"id": uid, "name": user.get("name"), "email": email}}
@@ -923,7 +972,12 @@ async def list_notifications(user=Depends(get_current_user)):
 
 @api.post("/notifications/{note_id}/read")
 async def read_notification(note_id: str, user=Depends(get_current_user)):
-    await db.notifications.update_one({"id": note_id}, {"$set": {"read": True}})
+    gids = await user_group_ids(user)
+    res = await db.notifications.update_one(
+        {"id": note_id, "$or": [{"user_id": user["id"]}, {"group_id": {"$in": gids}}]},
+        {"$set": {"read": True}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Δεν βρέθηκε")
     return {"ok": True}
 
 
@@ -938,22 +992,41 @@ async def read_all(user=Depends(get_current_user)):
 # ----------------------------------------------------------------------------
 # Groups
 # ----------------------------------------------------------------------------
+# No look-alike characters (0/O, 1/I); 10 chars from 31 symbols is ~8e14 combinations.
+GROUP_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+GROUP_CODE_LEN = 10
+
+
+def new_group_code() -> str:
+    return "".join(secrets.choice(GROUP_CODE_ALPHABET) for _ in range(GROUP_CODE_LEN))
+
+
 @api.post("/groups")
 async def create_group(body: GroupIn, user=Depends(get_current_user)):
-    code = uuid.uuid4().hex[:6].upper()
-    g = {"id": str(uuid.uuid4()), "name": body.name, "code": code,
+    g = {"id": str(uuid.uuid4()), "name": body.name.strip(),
          "owner_id": user["id"], "member_ids": [user["id"]],
          "created_at": datetime.now(timezone.utc).isoformat()}
-    await db.groups.insert_one(dict(g))
+    for _ in range(5):   # the unique index makes a (very unlikely) collision retry
+        g["code"] = new_group_code()
+        try:
+            await db.groups.insert_one(dict(g))
+            break
+        except DuplicateKeyError:
+            continue
+    else:
+        raise HTTPException(status_code=503, detail="Δεν ήταν δυνατή η δημιουργία ομάδας. Δοκιμάστε ξανά")
     await db.users.update_one({"_id": ObjectId(user["id"])}, {"$addToSet": {"group_ids": g["id"]}})
-    g.pop("_id", None)
     return g
 
 
 @api.post("/groups/join")
 async def join_group(body: JoinGroupIn, user=Depends(get_current_user)):
-    g = await db.groups.find_one({"code": body.code.upper()})
+    key = f"join:user:{user['id']}"
+    if await attempts_since(key, timedelta(hours=1)) >= JOIN_FAILS_PER_USER_HOUR:
+        raise too_many("Πολλές αποτυχημένες προσπάθειες. Δοκιμάστε ξανά αργότερα")
+    g = await db.groups.find_one({"code": body.code.strip().upper()})
     if not g:
+        await record_attempt(key)
         raise HTTPException(status_code=404, detail="Λάθος κωδικός ομάδας")
     await db.groups.update_one({"id": g["id"]}, {"$addToSet": {"member_ids": user["id"]}})
     await db.users.update_one({"_id": ObjectId(user["id"])}, {"$addToSet": {"group_ids": g["id"]}})
@@ -994,6 +1067,12 @@ async def startup():
     await db.verified_contacts.create_index([("user_id", 1), ("kind", 1), ("value", 1)], unique=True)
     await db.contact_challenges.create_index([("user_id", 1), ("kind", 1), ("value", 1), ("created_at", -1)])
     await db.contact_challenges.create_index("created_at")
+    await db.auth_attempts.create_index([("key", 1), ("created_at", -1)])
+    await db.auth_attempts.create_index("ttl", expireAfterSeconds=0)
+    try:
+        await db.groups.create_index("code", unique=True)
+    except OperationFailure as e:   # legacy data with a duplicate code must not stop the app booting
+        logger.error(f"could not create unique index on groups.code: {e}")
     await db.tracked_cases.create_index("id", unique=True)
     await db.notifications.create_index("id", unique=True)
     asyncio.create_task(monitor_loop())
