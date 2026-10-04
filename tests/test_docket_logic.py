@@ -119,3 +119,15 @@ def test_stuck_when_only_a_held_case_remains_ahead():
 def test_naive_timestamp_does_not_crash():
     d = docket(case(1), case(2, gak="2/2026"), lastStatusTimestamp="2026-10-05T09:00:00")
     assert analyze(d, "2/2026", now=NOW)["docket_last_update"] is not None
+
+
+# --- description of my case (shown on the card) ----------------------------------------
+def test_my_description_excludes_court_kind():
+    d = docket(case(1, gak="1/2026", description="Αγωγή αποζημίωσης", subCode="123"), courtKind="Μον. Πρωτοδικείο")
+    r = analyze(d, "1/2026", now=NOW)
+    assert r["my_description"] == "Αγωγή αποζημίωσης · Αντικείμενο 123"
+    assert "Μον. Πρωτοδικείο" in r["my_subject"]
+
+
+def test_my_description_is_none_when_unknown():
+    assert analyze(docket(case(1, gak="1/2026"), courtKind="Μον."), "1/2026", now=NOW)["my_description"] is None

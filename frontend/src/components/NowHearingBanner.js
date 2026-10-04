@@ -41,7 +41,7 @@ export default function NowHearingBanner({ cases }) {
           ) : (
             <div>
               <span className="text-6xl font-bold tracking-tight tabular-nums">{focus.remaining_ahead ?? "—"}</span>
-              <div className="text-xs text-[var(--txt-3)]">υποθέσεις μπροστά (#{focus.target_serial})</div>
+              <div className="text-xs text-[var(--txt-3)]">{focus.remaining_ahead === 1 ? "υπόθεση μπροστά" : "υποθέσεις μπροστά"} (#{focus.target_serial})</div>
             </div>
           )}
         </div>

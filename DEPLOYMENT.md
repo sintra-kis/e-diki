@@ -36,16 +36,28 @@ monitor; if it dies another takes over within ~6 minutes (3 × `MONITOR_INTERVAL
 4. Check the logs for `monitor tick: N cases in M docket queries` every `MONITOR_INTERVAL_SECONDS`.
 5. If e-diki answers 429/403 to the server, lower `EDIKI_CONCURRENCY` or raise `MONITOR_INTERVAL_SECONDS`.
 
-## 4. Operational notes
+## 4. Known deployment caveats
+
+- **Logo**: `frontend/src/constants/brand.js` loads the logo from an external URL (`customer-assets-…emergentagent.net`).
+  If that asset ever disappears the logo is simply hidden. To be self-contained, save the file as
+  `frontend/public/logo.png` and set `LOGO = process.env.PUBLIC_URL + "/logo.png"`.
+- **Lockfile**: the repo has no `yarn.lock`, so each build resolves dependency versions afresh. Commit the `yarn.lock`
+  produced by a successful `yarn install` for reproducible builds.
+- **Emergent-only packages**: `package.json` pulls `@emergentbase/overlay` and `@emergentbase/visual-edits` from
+  `assets.emergent.sh`, and `public/index.html` loads a script from the same host. They are not used by the app code; on a
+  host without access to `assets.emergent.sh` remove them (the production build was verified without the two packages).
+- `CI=true` turns ESLint warnings into build errors; the build is currently warning-free.
+
+## 5. Operational notes
 
 - Existing cases whose email/phone was never verified keep in-app notifications; email/SMS/call are paused until the
   owner verifies them from the dashboard banner ("Επαλήθευση").
 - Cases are retired automatically the day after the hearing; hearings on a later day are re-checked every 30 minutes.
 - Back up MongoDB (users, cases, verified contacts). Notifications and `auth_attempts` are disposable.
 
-## 5. Tests
+## 6. Tests
 
 ```bash
 pip install -r backend/requirements.txt
-python -m pytest tests -n 0 -q -c /dev/null     # 97 tests incl. an HTTP smoke test on an in-memory MongoDB
+python -m pytest tests -n 0 -q -c /dev/null     # 100 tests incl. an HTTP smoke test on an in-memory MongoDB
 ```

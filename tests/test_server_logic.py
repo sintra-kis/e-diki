@@ -157,3 +157,9 @@ def test_remaining_counter_goes_back_up_when_held_case_returns(monkeypatch):
     doc = base_doc(remaining_ahead=3, notified_approaching=True, now_hearing_serial="3")
     fake, sent = run_checks(monkeypatch, doc, [live(4)])
     assert [n["type"] for n in fake.notifications.docs] == ["progress"]
+
+
+def test_greek_plural_in_messages():
+    assert server.remaining_phrase(1) == "Απομένει 1 υπόθεση"
+    assert server.remaining_phrase(3) == "Απομένουν 3 υποθέσεις"
+    assert server.remaining_phrase(0) == "Απομένουν 0 υποθέσεις"

@@ -60,6 +60,7 @@ export default function AddCaseDialog({ open, onClose, onAdded, groups, defaultE
       .then((r) => setKinds(r.data || []))
       .catch(() => setKinds([]))
       .finally(() => setLoading((l) => ({ ...l, kinds: false })));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [f.court_name]);
 
   useEffect(() => {
@@ -70,6 +71,7 @@ export default function AddCaseDialog({ open, onClose, onAdded, groups, defaultE
       .then((r) => setCats(r.data || []))
       .catch(() => setCats([]))
       .finally(() => setLoading((l) => ({ ...l, cats: false })));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [f.court_name, f.court_kind]);
 
   if (!open) return null;

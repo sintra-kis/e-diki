@@ -61,6 +61,16 @@ def find_case(cases: list, entered: str) -> Optional[dict]:
     return None
 
 
+def case_description(case: dict) -> Optional[str]:
+    """What the case is about (description / subject code), without the court kind."""
+    parts = []
+    if case.get("description"):
+        parts.append(str(case["description"]))
+    if case.get("subCode"):
+        parts.append(f"Αντικείμενο {case['subCode']}")
+    return " · ".join(parts) or None
+
+
 def case_subject(case: dict, docket: dict) -> str:
     parts = []
     if case.get("description"):
@@ -143,6 +153,7 @@ def analyze(docket: dict, entered_number: str, stuck_minutes: int = 20, now: Opt
         "court_category": docket.get("courtCategory"),
         "target_serial": target.get("serialNumber"),
         "my_subject": case_subject(target, docket),
+        "my_description": case_description(target),
         "status_key": tkey,
         "status_label": tlabel,
         "remaining_ahead": remaining,

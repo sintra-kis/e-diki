@@ -21,6 +21,7 @@ export default function Dashboard() {
   const [unread, setUnread] = useState(0);
   const [pending, setPending] = useState([]); // unverified emails/numbers used by existing cases
   const [showContacts, setShowContacts] = useState(false);
+  const [notesTick, setNotesTick] = useState(0);
 
   const loadCases = () => api.get("/cases").then((r) => setCases(r.data))
     .catch(() => {}) // keep the last known state on a transient network error
@@ -38,11 +39,11 @@ export default function Dashboard() {
   const groupName = useMemo(() => Object.fromEntries(groups.map((g) => [g.id, g.name])), [groups]);
   const feedDown = cases.length > 0 && cases.every((c) => c.feed_ok === false);
 
-  const upsert = (c) => setCases((p) => {
+  const upsert = (c) => { setNotesTick((t) => t + 1); setCases((p) => {
     const i = p.findIndex((x) => x.id === c.id);
     if (i === -1) return [c, ...p];
     const n = [...p]; n[i] = c; return n;
-  });
+  }); };
 
   return (
     <div className="relative z-10 min-h-screen">
@@ -71,7 +72,7 @@ export default function Dashboard() {
                 <Bell className="w-4 h-4" />
                 {unread > 0 && <span className="absolute -top-1 -right-1 min-w-4 h-4 px-1 rounded-full bg-rose-500 text-[10px] font-bold text-white grid place-items-center">{unread}</span>}
               </button>
-              <Notifications open={showNotes} onToggle={() => setShowNotes(false)} onCountChange={setUnread} />
+              <Notifications open={showNotes} onToggle={() => setShowNotes(false)} onCountChange={setUnread} refreshKey={notesTick} />
             </div>
 
             <button data-testid="add-case-btn" onClick={() => setShowAdd(true)} className="btn-primary px-4 h-9 flex items-center gap-1.5 text-sm">

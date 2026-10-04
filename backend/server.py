@@ -490,7 +490,7 @@ ATHENS = ZoneInfo("Europe/Athens")
 _case_locks: dict = {}
 
 CARRY_FIELDS = ("docket_id", "docket_code", "building", "room", "court_kind", "court_category",
-                "target_serial", "my_subject", "status_key", "status_label", "remaining_ahead",
+                "target_serial", "my_subject", "my_description", "status_key", "status_label", "remaining_ahead",
                 "paused_ahead", "finished_ahead", "postponed_ahead", "completed_count", "total_cases",
                 "now_hearing_serial", "now_hearing_subject", "started", "stuck", "docket_last_update")
 
@@ -500,15 +500,20 @@ def _venue_lines(live: dict) -> List[str]:
             f"Κτίριο/Αίθουσα: {live.get('building') or '-'} / {live.get('room') or '-'}"]
 
 
+def remaining_phrase(n: int) -> str:
+    return "Απομένει 1 υπόθεση" if n == 1 else f"Απομένουν {n} υποθέσεις"
+
+
 def ahead_detail(live: dict) -> str:
-    """Why the number is what it is: held-back and postponed cases are visible to the lawyer."""
-    parts = [f"{live['remaining_ahead']} μπροστά σας"]
+    """Why the number is what it is: held-back and postponed cases are visible to the lawyer.
+    (Label: value form, so no Greek number agreement is needed.)"""
+    parts = [f"μπροστά σας: {live['remaining_ahead']}"]
     if live.get("paused_ahead"):
-        parts.append(f"εκ των οποίων {live['paused_ahead']} διακοπείσες/κρατημένες")
+        parts.append(f"εκ των οποίων διακοπείσες/κρατημένες: {live['paused_ahead']}")
     if live.get("postponed_ahead"):
-        parts.append(f"{live['postponed_ahead']} αναβλήθηκαν")
+        parts.append(f"αναβληθείσες: {live['postponed_ahead']}")
     if live.get("finished_ahead"):
-        parts.append(f"{live['finished_ahead']} ολοκληρώθηκαν")
+        parts.append(f"ολοκληρωμένες: {live['finished_ahead']}")
     return ", ".join(parts)
 
 
@@ -583,24 +588,24 @@ async def _evaluate_locked(tc: dict, fetched: Optional[DocketFetch] = None):
     # 2. approaching its turn (first time within the threshold)
     if waiting and live.get("started") and remaining <= threshold and not tc.get("notified_approaching"):
         title = "Η υπόθεσή σας πλησιάζει!"
-        msg = (f"Απομένουν {remaining} υποθέσεις πριν από τη δική σας "
+        msg = (f"{remaining_phrase(remaining)} πριν από τη δική σας "
                f"({case_tag(tc)}, σειρά #{live.get('target_serial')}). "
                f"Τώρα δικάζεται η σειρά #{live.get('now_hearing_serial') or '—'}. ({ahead_detail(live)})")
         notes.append(("approaching", title, msg))
         alerts.append((title, [msg, *_venue_lines(live)],
-                       f"Προσοχή! Απομένουν {remaining} υποθέσεις πριν από τη δική σας, "
+                       f"Προσοχή! {remaining_phrase(remaining)} πριν από τη δική σας, "
                        f"αριθμός {tc.get('case_number')}, σειρά {live.get('target_serial')}.", True))
         update["notified_approaching"] = True
     elif (waiting and live.get("started") and tc.get("notified_approaching") and remaining <= threshold
           and tc.get("remaining_ahead") is not None and remaining != tc.get("remaining_ahead")):
         # 2b. already inside the threshold: tell the lawyer every time the count moves
         # (a case finished, was postponed, or a held-back case came back).
-        title = f"Απομένουν {remaining} υποθέσεις"
+        title = remaining_phrase(remaining)
         msg = (f"Η υπόθεσή σας {case_tag(tc)} (σειρά #{live.get('target_serial')}): "
                f"από {tc.get('remaining_ahead')} → {remaining} υποθέσεις μπροστά. ({ahead_detail(live)})")
         notes.append(("progress", title, msg))
         alerts.append((title, [msg, *_venue_lines(live)],
-                       f"Υπόθεση {tc.get('case_number')}: απομένουν {remaining} μπροστά σας.", False))
+                       f"Υπόθεση {tc.get('case_number')}: {remaining_phrase(remaining).lower()} μπροστά σας.", False))
     if remaining > threshold:
         update["notified_approaching"] = False
 
