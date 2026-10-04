@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import api from "@/lib/api";
 
 const TYPE_ICON = {
-  approaching: "🔔", status_change: "⚖️", progress: "➡️", stuck: "⚠️", feed_down: "📡", feed_restored: "✅",
+  approaching: "🔔", status_change: "⚖️", progress: "➡️", stuck: "⚠️", feed_down: "📡", feed_restored: "✅", verify_needed: "🛡️",
 };
 
 export default function Notifications({ open, onToggle, onCountChange }) {

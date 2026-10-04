@@ -20,6 +20,8 @@ class Col:
             elif isinstance(v, dict):
                 if "$gte" in v and not d.get(k, "") >= v["$gte"]:
                     return False
+                if "$lt" in v and not d.get(k, "") < v["$lt"]:
+                    return False
                 if "$in" in v and d.get(k) not in v["$in"]:
                     return False
             elif d.get(k) != v:
@@ -63,6 +65,18 @@ class Col:
             self.docs.append({**{k: v for k, v in q.items() if not k.startswith("$")}, **upd.get("$set", {})})
             return SimpleNamespace(matched_count=0)
         return SimpleNamespace(matched_count=0)
+
+    async def find_one_and_update(self, q, upd, upsert=False):
+        for d in self.docs:
+            if self._match(d, q):
+                d.update(upd.get("$set", {}))
+                return dict(d)
+        if upsert:
+            new = {k: v for k, v in q.items() if not k.startswith("$")}
+            if "_id" in new and any(x.get("_id") == new["_id"] for x in self.docs):
+                raise DuplicateKeyError("duplicate _id")   # what MongoDB does when the filter misses
+            self.docs.append({**new, **upd.get("$set", {})})
+        return None
 
     def find(self, q):
         outer = self

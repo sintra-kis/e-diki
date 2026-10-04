@@ -45,6 +45,9 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 JWT_SECRET = os.environ['JWT_SECRET']
+if len(JWT_SECRET) < 32:
+    logger.warning("JWT_SECRET is shorter than 32 characters; use a long random value in production "
+                   "(e.g. `python -c \"import secrets; print(secrets.token_urlsafe(48))\"`)")
 JWT_ALGORITHM = "HS256"
 MONITOR_INTERVAL = int(os.environ.get('MONITOR_INTERVAL_SECONDS', '120'))
 STUCK_MINUTES = int(os.environ.get('STUCK_MINUTES', '20'))
@@ -234,6 +237,8 @@ def _to_e164(phone: str) -> Optional[str]:
     if not phone:
         return None
     p = re.sub(r"[^\d+]", "", phone.strip())
+    if not p:
+        return None
     if p.startswith("+"):
         return p
     if p.startswith("00"):
@@ -273,16 +278,43 @@ def make_call(to: str, text: str) -> bool:
         return False
 
 
+async def _warn_unverified(tc: dict) -> None:
+    """Tell the owner once, in-app, that external alerts are paused until they verify."""
+    if tc.get("notified_unverified"):
+        return
+    await db.tracked_cases.update_one({"id": tc["id"]}, {"$set": {"notified_unverified": True}})
+    await create_notification(
+        tc, "verify_needed", "Επαληθεύστε τα στοιχεία ειδοποίησης",
+        f"Οι ειδοποιήσεις email/SMS/κλήσης για την υπόθεση {case_tag(tc)} είναι σε αναμονή μέχρι να "
+        f"επαληθεύσετε το email ή το τηλέφωνό σας (Πίνακας → «Επαλήθευση»). Οι ειδοποιήσεις μέσα στην "
+        f"εφαρμογή συνεχίζουν κανονικά.")
+
+
 async def dispatch_alert(tc: dict, subject: str, lines: List[str], short_text: str, voice: bool = True):
+    """Send through the chosen channels, but only to contacts the case owner has verified."""
     channels = tc.get("notify_channels") or ["email"]
-    if "email" in channels and tc.get("notify_email"):
-        await send_email(to=tc["notify_email"], subject=f"[e-dikiΜου] {subject}",
-                         html=build_alert_html(subject, lines))
-    phone = tc.get("phone")
-    if phone and "sms" in channels:
-        await asyncio.to_thread(send_sms, phone, f"e-dikiΜου: {short_text}")
-    if phone and voice and "call" in channels:
-        await asyncio.to_thread(make_call, phone, short_text)
+    uid = tc.get("user_id")
+    skipped = False
+
+    email = (tc.get("notify_email") or "").lower()
+    if "email" in channels and email:
+        if await is_verified(uid, "email", email):
+            await send_email(to=email, subject=f"[e-dikiΜου] {subject}", html=build_alert_html(subject, lines))
+        else:
+            skipped = True
+
+    phone = _to_e164(tc.get("phone") or "")
+    wants_phone = phone and ("sms" in channels or ("call" in channels and voice))
+    if wants_phone:
+        if await is_verified(uid, "phone", phone):
+            if "sms" in channels:
+                await asyncio.to_thread(send_sms, phone, f"e-dikiΜου: {short_text}")
+            if voice and "call" in channels:
+                await asyncio.to_thread(make_call, phone, short_text)
+        else:
+            skipped = True
+    if skipped:
+        await _warn_unverified(tc)
 
 
 # ----------------------------------------------------------------------------
@@ -609,6 +641,31 @@ async def _emit(tc: dict, notes: list, alerts: list):
 
 
 FUTURE_CHECK_MINUTES = int(os.environ.get('FUTURE_CHECK_MINUTES', '30'))
+WORKER_ID = uuid.uuid4().hex
+LEASE_SECONDS = max(3 * MONITOR_INTERVAL, 60)
+
+
+async def acquire_monitor_lease() -> bool:
+    """Only one worker/process runs the monitor at a time.
+
+    A lease document is taken (or renewed by its owner) with an atomic upsert: if another
+    worker holds an unexpired lease the filter misses, the upsert collides on _id and we
+    stay passive. A crashed leader is replaced once its lease expires.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        await db.locks.find_one_and_update(
+            {"_id": "monitor", "$or": [{"owner": WORKER_ID}, {"expires_at": {"$lt": now.isoformat()}}]},
+            {"$set": {"owner": WORKER_ID, "expires_at": (now + timedelta(seconds=LEASE_SECONDS)).isoformat()}},
+            upsert=True)
+        return True
+    except DuplicateKeyError:
+        return False
+
+
+async def release_monitor_lease() -> None:
+    await db.locks.update_one({"_id": "monitor", "owner": WORKER_ID},
+                              {"$set": {"expires_at": datetime.now(timezone.utc).isoformat()}})
 
 
 def _today_athens() -> str:
@@ -658,8 +715,9 @@ async def monitor_loop():
     while True:
         started = asyncio.get_running_loop().time()
         try:
-            stats = await monitor_tick()
-            logger.info("monitor tick: %s cases in %s dockets queries", stats["cases"], stats["groups"])
+            if await acquire_monitor_lease():
+                stats = await monitor_tick()
+                logger.info("monitor tick: %s cases in %s docket queries", stats["cases"], stats["groups"])
         except Exception as e:
             logger.error(f"monitor loop error: {e}")
         # fixed cadence: a slow pass shortens the pause instead of stretching the interval
@@ -959,6 +1017,21 @@ async def list_contacts(user=Depends(get_current_user)):
     return [{"kind": d["kind"], "value": d["value"]} for d in docs]
 
 
+@api.get("/contacts/pending")
+async def pending_contacts(user=Depends(get_current_user)):
+    """Contacts used by the user's own cases that are not verified yet (alerts are paused for them)."""
+    wanted: dict = {}
+    for tc in await db.tracked_cases.find({"user_id": user["id"]}).to_list(None):
+        channels = tc.get("notify_channels") or ["email"]
+        if "email" in channels and tc.get("notify_email"):
+            wanted[("email", tc["notify_email"].lower())] = True
+        phone = _to_e164(tc.get("phone") or "")
+        if phone and ({"sms", "call"} & set(channels)):
+            wanted[("phone", phone)] = True
+    pending = [{"kind": k, "value": v} for (k, v) in wanted if not await is_verified(user["id"], k, v)]
+    return pending
+
+
 async def require_verified_contacts(user_id: str, body: "TrackIn") -> None:
     needed = []
     if "email" in body.notify_channels and body.notify_email:
@@ -1146,15 +1219,29 @@ async def list_groups(user=Depends(get_current_user)):
 # ----------------------------------------------------------------------------
 # Lifecycle
 # ----------------------------------------------------------------------------
+@api.get("/health")
+async def health():
+    try:
+        await db.command("ping")
+    except Exception as e:
+        logger.error(f"health check failed: {e}")
+        raise HTTPException(status_code=503, detail="database unavailable")
+    return {"status": "ok"}
+
+
 @api.get("/")
 async def root():
     return {"app": "e-dikiΜου", "status": "ok"}
 
 
+# Comma-separated list of allowed browser origins; the default "*" is fine because auth uses a
+# bearer token (no cookies), but restrict it to the real site in production.
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
+
 app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1184,6 +1271,10 @@ async def shutdown():
     task = getattr(app.state, "monitor_task", None)
     if task:
         task.cancel()
+        try:
+            await release_monitor_lease()   # let another worker take over immediately
+        except Exception as e:
+            logger.error(f"could not release monitor lease: {e}")
     if _http is not None:
         await _http.aclose()
     client.close()
