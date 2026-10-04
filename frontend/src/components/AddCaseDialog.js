@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { X, Loader2, Plus, Mail, MessageSquare, PhoneCall } from "lucide-react";
 import api, { errMsg } from "@/lib/api";
+import ContactVerify, { normalizeContact } from "@/components/ContactVerify";
 
 const TYPES = ["Πολιτικό", "Ποινικό", "Διοικητικό"];
 const CHANNELS = [
@@ -23,6 +24,7 @@ export default function AddCaseDialog({ open, onClose, onAdded, groups, defaultE
     threshold: 5, group_id: "", label: "",
   });
   const [twilioOn, setTwilioOn] = useState(false);
+  const [verified, setVerified] = useState([]); // [{kind, value}] proven by the current user
   const [names, setNames] = useState([]);
   const [kinds, setKinds] = useState([]);
   const [cats, setCats] = useState([]);
@@ -33,6 +35,7 @@ export default function AddCaseDialog({ open, onClose, onAdded, groups, defaultE
 
   useEffect(() => {
     api.get("/config").then((r) => setTwilioOn(!!r.data?.twilio_enabled)).catch(() => {});
+    api.get("/contacts").then((r) => setVerified(r.data || [])).catch(() => {});
   }, []);
 
   // The full list of courts comes straight from e-diki and depends on the type only:
@@ -78,10 +81,15 @@ export default function AddCaseDialog({ open, onClose, onAdded, groups, defaultE
   });
   const needsPhone = f.notify_channels.some((c) => c === "sms" || c === "call");
   const needsEmail = f.notify_channels.includes("email");
+  const isVerified = (kind, value) => verified.some((v) => v.kind === kind && v.value === normalizeContact(kind, value));
+  const emailOk = !needsEmail || isVerified("email", f.notify_email);
+  const phoneOk = !needsPhone || isVerified("phone", f.phone);
+  const markVerified = (kind, value) => setVerified((p) => (p.some((v) => v.kind === kind && v.value === value) ? p : [...p, { kind, value }]));
 
   const submit = async (e) => {
     e.preventDefault();
     if (!f.notify_channels.length) { toast.error("Επιλέξτε τουλάχιστον έναν τρόπο ειδοποίησης."); return; }
+    if (!emailOk || !phoneOk) { toast.error("Επαληθεύστε πρώτα το email/τηλέφωνο ειδοποιήσεων."); return; }
     setSaving(true);
     try {
       const payload = {
@@ -173,6 +181,7 @@ export default function AddCaseDialog({ open, onClose, onAdded, groups, defaultE
               <input data-testid="field-email" type="email" required value={f.notify_email}
                 onChange={(e) => upd("notify_email", e.target.value)} className="field w-full px-3 py-2.5 text-sm"
                 placeholder="dikigoros@lawfirm.gr" />
+              <ContactVerify kind="email" value={f.notify_email} verified={emailOk} onVerified={markVerified} />
             </Field>
           )}
           {needsPhone && (
@@ -180,6 +189,7 @@ export default function AddCaseDialog({ open, onClose, onAdded, groups, defaultE
               <input data-testid="field-phone" type="tel" required value={f.phone}
                 onChange={(e) => upd("phone", e.target.value)} className="field w-full px-3 py-2.5 text-sm"
                 placeholder="69XXXXXXXX ή +30…" />
+              <ContactVerify kind="phone" value={f.phone} verified={phoneOk} onVerified={markVerified} />
             </Field>
           )}
           <Field label="Ειδοποίηση όταν απομένουν">
@@ -204,7 +214,7 @@ export default function AddCaseDialog({ open, onClose, onAdded, groups, defaultE
 
           <div className="sm:col-span-2 flex justify-end gap-3 pt-2">
             <button type="button" onClick={onClose} className="btn-ghost px-5 py-2.5">Άκυρο</button>
-            <button data-testid="add-case-submit" disabled={saving}
+            <button data-testid="add-case-submit" disabled={saving || !emailOk || !phoneOk}
               className="btn-primary px-6 py-2.5 flex items-center gap-2">
               {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
               Προσθήκη & Παρακολούθηση

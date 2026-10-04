@@ -6,7 +6,10 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 import asyncio
+import hashlib
+import hmac
 import logging
+import secrets
 import re
 import uuid
 import ipaddress
@@ -14,7 +17,7 @@ from datetime import datetime, timezone, timedelta
 from html import escape
 from html.parser import HTMLParser
 from urllib.parse import urlparse
-from typing import Optional, List
+from typing import Optional, List, Literal
 from zoneinfo import ZoneInfo
 
 import bcrypt
@@ -24,7 +27,7 @@ from bson import ObjectId
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+from pydantic import BaseModel, EmailStr, Field, TypeAdapter, field_validator, model_validator
 
 from docket_logic import analyze
 
@@ -694,6 +697,131 @@ async def court_categories(courtType: str, courtName: str, courtKind: Optional[s
 
 
 # ----------------------------------------------------------------------------
+# Contact verification (OTP): alerts only go to an email/phone the user has proven they own
+# ----------------------------------------------------------------------------
+CODE_TTL_MIN = 10
+CODE_MAX_ATTEMPTS = 5
+CODE_COOLDOWN_S = 60          # between codes for the same user + contact
+CODE_PER_USER_HOUR = 5        # codes one account may request per hour
+CODE_PER_CONTACT_DAY = 3      # codes any accounts may trigger towards one contact per day
+_email_adapter = TypeAdapter(EmailStr)
+
+
+class ContactIn(BaseModel):
+    kind: Literal["email", "phone"]
+    value: str = Field(min_length=3, max_length=254)
+
+
+class ContactVerifyIn(ContactIn):
+    code: str = Field(min_length=4, max_length=10)
+
+
+def normalize_contact(kind: str, value: str) -> str:
+    value = (value or "").strip()
+    if kind == "email":
+        try:
+            return str(_email_adapter.validate_python(value)).lower()
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Μη έγκυρο email")
+    num = _to_e164(value)
+    if not num or not re.fullmatch(r"\+\d{8,15}", num):
+        raise HTTPException(status_code=422, detail="Μη έγκυρος αριθμός τηλεφώνου")
+    return num
+
+
+def _code_hash(challenge_id: str, code: str) -> str:
+    return hmac.new(JWT_SECRET.encode(), f"{challenge_id}:{code}".encode(), hashlib.sha256).hexdigest()
+
+
+async def is_verified(user_id: str, kind: str, value: str) -> bool:
+    return bool(await db.verified_contacts.find_one({"user_id": user_id, "kind": kind, "value": value}))
+
+
+async def _send_code(kind: str, value: str, code: str) -> bool:
+    if kind == "email":
+        subject = "Κωδικός επαλήθευσης"
+        lines = [f"Ο κωδικός επαλήθευσης είναι: {code}",
+                 f"Ισχύει για {CODE_TTL_MIN} λεπτά. Αν δεν τον ζητήσατε εσείς, αγνοήστε αυτό το μήνυμα."]
+        try:
+            return bool(await send_email(to=value, subject=f"[e-dikiΜου] {subject}",
+                                         html=build_alert_html(subject, lines)))
+        except ValueError:
+            return False
+    return await asyncio.to_thread(send_sms, value, f"e-dikiΜου: κωδικός επαλήθευσης {code} (ισχύει {CODE_TTL_MIN}')")
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+@api.post("/contacts/request")
+async def request_contact_code(body: ContactIn, user=Depends(get_current_user)):
+    value = normalize_contact(body.kind, body.value)
+    if await is_verified(user["id"], body.kind, value):
+        return {"ok": True, "already_verified": True, "value": value}
+
+    now = datetime.now(timezone.utc)
+    mine = {"user_id": user["id"], "kind": body.kind, "value": value}
+    last = await db.contact_challenges.find_one(mine, sort=[("created_at", -1)])
+    if last and last["created_at"] > _iso(now - timedelta(seconds=CODE_COOLDOWN_S)):
+        raise HTTPException(status_code=429, detail="Περιμένετε λίγο πριν ζητήσετε νέο κωδικό")
+    if await db.contact_challenges.count_documents(
+            {"user_id": user["id"], "created_at": {"$gte": _iso(now - timedelta(hours=1))}}) >= CODE_PER_USER_HOUR:
+        raise HTTPException(status_code=429, detail="Πολλά αιτήματα κωδικού. Δοκιμάστε αργότερα")
+    if await db.contact_challenges.count_documents(
+            {"kind": body.kind, "value": value,
+             "created_at": {"$gte": _iso(now - timedelta(days=1))}}) >= CODE_PER_CONTACT_DAY:
+        raise HTTPException(status_code=429, detail="Έχουν σταλεί ήδη πολλοί κωδικοί σε αυτή τη διεύθυνση/αριθμό")
+
+    code = f"{secrets.randbelow(10 ** 6):06d}"
+    cid = str(uuid.uuid4())
+    await db.contact_challenges.insert_one({
+        **mine, "id": cid, "code_hash": _code_hash(cid, code), "attempts": 0, "used": False,
+        "expires_at": _iso(now + timedelta(minutes=CODE_TTL_MIN)), "created_at": _iso(now)})
+    if not await _send_code(body.kind, value, code):
+        await db.contact_challenges.delete_one({"id": cid})
+        raise HTTPException(status_code=503, detail="Δεν ήταν δυνατή η αποστολή κωδικού αυτή τη στιγμή")
+    return {"ok": True, "value": value, "expires_in": CODE_TTL_MIN * 60}
+
+
+@api.post("/contacts/verify")
+async def verify_contact(body: ContactVerifyIn, user=Depends(get_current_user)):
+    value = normalize_contact(body.kind, body.value)
+    ch = await db.contact_challenges.find_one(
+        {"user_id": user["id"], "kind": body.kind, "value": value}, sort=[("created_at", -1)])
+    now = _iso(datetime.now(timezone.utc))
+    if not ch or ch.get("used") or ch["expires_at"] < now:
+        raise HTTPException(status_code=400, detail="Ο κωδικός έληξε ή δεν υπάρχει. Ζητήστε νέο")
+    if ch["attempts"] >= CODE_MAX_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="Πολλές αποτυχημένες προσπάθειες. Ζητήστε νέο κωδικό")
+    if not hmac.compare_digest(ch["code_hash"], _code_hash(ch["id"], body.code.strip())):
+        await db.contact_challenges.update_one({"id": ch["id"]}, {"$inc": {"attempts": 1}})
+        raise HTTPException(status_code=400, detail="Λάθος κωδικός")
+    await db.contact_challenges.update_one({"id": ch["id"]}, {"$set": {"used": True}})
+    await db.verified_contacts.update_one(
+        {"user_id": user["id"], "kind": body.kind, "value": value},
+        {"$set": {"verified_at": now}}, upsert=True)
+    return {"ok": True, "value": value}
+
+
+@api.get("/contacts")
+async def list_contacts(user=Depends(get_current_user)):
+    docs = await db.verified_contacts.find({"user_id": user["id"]}).to_list(50)
+    return [{"kind": d["kind"], "value": d["value"]} for d in docs]
+
+
+async def require_verified_contacts(user_id: str, body: "TrackIn") -> None:
+    needed = []
+    if "email" in body.notify_channels and body.notify_email:
+        needed.append(("email", str(body.notify_email).lower(), "Το email"))
+    if ({"sms", "call"} & set(body.notify_channels)) and body.phone:
+        needed.append(("phone", body.phone, "Το τηλέφωνο"))
+    for kind, value, label in needed:
+        if not await is_verified(user_id, kind, value):
+            raise HTTPException(status_code=400, detail=f"{label} δεν έχει επαληθευτεί. Επαληθεύστε το πριν προχωρήσετε")
+
+
+# ----------------------------------------------------------------------------
 # Tracked cases
 # ----------------------------------------------------------------------------
 def public_case(tc: dict) -> dict:
@@ -710,6 +838,7 @@ async def user_group_ids(user) -> List[str]:
 async def add_case(body: TrackIn, user=Depends(get_current_user)):
     if body.group_id and body.group_id not in await user_group_ids(user):
         raise HTTPException(status_code=403, detail="Δεν ανήκετε σε αυτή την ομάδα")
+    await require_verified_contacts(user["id"], body)
     tc = {
         "id": str(uuid.uuid4()),
         "user_id": user["id"],
@@ -862,6 +991,9 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     await db.users.create_index("email", unique=True)
+    await db.verified_contacts.create_index([("user_id", 1), ("kind", 1), ("value", 1)], unique=True)
+    await db.contact_challenges.create_index([("user_id", 1), ("kind", 1), ("value", 1), ("created_at", -1)])
+    await db.contact_challenges.create_index("created_at")
     await db.tracked_cases.create_index("id", unique=True)
     await db.notifications.create_index("id", unique=True)
     asyncio.create_task(monitor_loop())
