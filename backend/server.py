@@ -48,6 +48,18 @@ EMAIL_KEY = os.environ.get("EMERGENT_EMAIL_KEY")
 EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME", "e-dikiΜου")
 EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
 
+# Twilio (SMS + voice call) - optional, enabled when credentials present
+TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_FROM = os.environ.get("TWILIO_PHONE_NUMBER")
+_twilio_client = None
+if TWILIO_SID and TWILIO_TOKEN:
+    try:
+        from twilio.rest import Client as TwilioClient
+        _twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
+    except Exception as e:
+        logger.error(f"Twilio init failed: {e}")
+
 app = FastAPI(title="e-dikiΜου")
 api = APIRouter(prefix="/api")
 
@@ -207,6 +219,61 @@ def build_alert_html(title: str, lines: List[str]) -> str:
         'είναι πλήρως ενημερωμένα. Δεν ζητάμε ποτέ κωδικούς μέσω email.</p>'
         '</td></tr></table></td></tr></table>'
     )
+
+
+def _to_e164(phone: str) -> Optional[str]:
+    if not phone:
+        return None
+    p = re.sub(r"[^\d+]", "", phone.strip())
+    if p.startswith("+"):
+        return p
+    if p.startswith("00"):
+        return "+" + p[2:]
+    if p.startswith("0"):
+        return "+30" + p[1:]  # default to Greece
+    if len(p) == 10:
+        return "+30" + p
+    return "+" + p
+
+
+def send_sms(to: str, text: str) -> bool:
+    num = _to_e164(to)
+    if not _twilio_client or not TWILIO_FROM or not num:
+        logger.warning("SMS skipped (twilio not configured or bad number)")
+        return False
+    try:
+        _twilio_client.messages.create(to=num, from_=TWILIO_FROM, body=text[:600])
+        return True
+    except Exception as e:
+        logger.error(f"SMS send error: {e}")
+        return False
+
+
+def make_call(to: str, text: str) -> bool:
+    num = _to_e164(to)
+    if not _twilio_client or not TWILIO_FROM or not num:
+        logger.warning("Call skipped (twilio not configured or bad number)")
+        return False
+    try:
+        twiml = (f'<Response><Say language="el-GR" voice="Polly.Aditi">{escape(text)}</Say>'
+                 f'<Pause length="1"/><Say language="el-GR">{escape(text)}</Say></Response>')
+        _twilio_client.calls.create(to=num, from_=TWILIO_FROM, twiml=twiml)
+        return True
+    except Exception as e:
+        logger.error(f"Call error: {e}")
+        return False
+
+
+async def dispatch_alert(tc: dict, subject: str, lines: List[str], short_text: str):
+    channels = tc.get("notify_channels") or ["email"]
+    if "email" in channels and tc.get("notify_email"):
+        await send_email(to=tc["notify_email"], subject=f"[e-dikiΜου] {subject}",
+                         html=build_alert_html(subject, lines))
+    phone = tc.get("phone")
+    if phone and "sms" in channels:
+        await asyncio.to_thread(send_sms, phone, f"e-dikiΜου: {short_text}")
+    if phone and "call" in channels:
+        await asyncio.to_thread(make_call, phone, short_text)
 
 
 # ----------------------------------------------------------------------------
@@ -414,7 +481,7 @@ async def evaluate_case(tc: dict):
 
     threshold = tc.get("threshold", 5)
     notes = []
-    emails = []
+    alerts = []
 
     # 1. status change of my case
     prev_status = tc.get("status_key")
@@ -423,9 +490,10 @@ async def evaluate_case(tc: dict):
         msg = f"Η υπόθεση {case_tag(tc)} (σειρά #{live.get('target_serial')}) είναι πλέον: {live['status_label']}."
         notes.append(("status_change", title, msg))
         if live["status_key"] in ("dikazetai", "oloklirothike", "anavlithike"):
-            emails.append((title, [msg,
+            alerts.append((title, [msg,
                                    f"Δικαστήριο: {live.get('court_name')} — {live.get('court_kind') or ''}",
-                                   f"Κτίριο/Αίθουσα: {live.get('building') or '-'} / {live.get('room') or '-'}"]))
+                                   f"Κτίριο/Αίθουσα: {live.get('building') or '-'} / {live.get('room') or '-'}"],
+                           f"Η υπόθεση {tc.get('case_number')} είναι πλέον: {live['status_label']}."))
 
     # 2. approaching its turn
     if (live["status_key"] == "anamenetai" and live.get("started")
@@ -435,9 +503,11 @@ async def evaluate_case(tc: dict):
                f"({case_tag(tc)}, σειρά #{live.get('target_serial')}). "
                f"Τώρα δικάζεται η σειρά #{live.get('now_hearing_serial') or '—'}.")
         notes.append(("approaching", title, msg))
-        emails.append((title, [msg,
+        alerts.append((title, [msg,
                                f"Δικαστήριο: {live.get('court_name')} — {live.get('court_kind') or ''}",
-                               f"Κτίριο/Αίθουσα: {live.get('building') or '-'} / {live.get('room') or '-'}"]))
+                               f"Κτίριο/Αίθουσα: {live.get('building') or '-'} / {live.get('room') or '-'}"],
+                       f"Προσοχή! Απομένουν {live['remaining_ahead']} υποθέσεις πριν από τη δική σας, "
+                       f"αριθμός {tc.get('case_number')}, σειρά {live.get('target_serial')}."))
         update["notified_approaching"] = True
     if live["remaining_ahead"] > threshold:
         update["notified_approaching"] = False
@@ -457,7 +527,9 @@ async def evaluate_case(tc: dict):
                f"ενημερωθεί για πάνω από {STUCK_MINUTES} λεπτά, ενώ η υπόθεσή σας "
                f"({case_tag(tc)}) αναμένεται ακόμη. Ελέγξτε χειροκίνητα.")
         notes.append(("stuck", title, msg))
-        emails.append((title, [msg]))
+        alerts.append((title, [msg],
+                       f"Προσοχή: το πινάκιο στο {live.get('court_name')} φαίνεται στάσιμο "
+                       f"ενώ η υπόθεσή σας αναμένεται ακόμη."))
         update["notified_stuck"] = True
     if not live.get("stuck"):
         update["notified_stuck"] = False
@@ -469,10 +541,8 @@ async def evaluate_case(tc: dict):
     await db.tracked_cases.update_one({"id": tc["id"]}, {"$set": update})
     for ntype, title, msg in notes:
         await create_notification(tc, ntype, title, msg)
-    for subject, lines in emails:
-        if tc.get("notify_email"):
-            await send_email(to=tc["notify_email"], subject=f"[e-dikiΜου] {subject}",
-                             html=build_alert_html(subject, lines))
+    for subject, lines, short in alerts:
+        await dispatch_alert(tc, subject, lines, short)
 
 
 async def monitor_loop():
@@ -511,7 +581,9 @@ class TrackIn(BaseModel):
     court_category: Optional[str] = None
     court_date: str
     case_number: str
-    notify_email: EmailStr
+    notify_email: Optional[EmailStr] = None
+    notify_channels: List[str] = ["email"]
+    phone: Optional[str] = None
     threshold: int = 5
     group_id: Optional[str] = None
     label: Optional[str] = None
@@ -560,6 +632,12 @@ async def me(user=Depends(get_current_user)):
 # ----------------------------------------------------------------------------
 # e-diki dropdown routes (public)
 # ----------------------------------------------------------------------------
+@api.get("/config")
+async def config():
+    return {"twilio_enabled": bool(_twilio_client and TWILIO_FROM),
+            "email_enabled": bool(EMAIL_KEY)}
+
+
 @api.get("/ediki/court-types")
 async def court_types():
     return [{"label": "Πολιτικό", "value": "Πολιτικό"},
@@ -618,7 +696,9 @@ async def add_case(body: TrackIn, user=Depends(get_current_user)):
         "court_category": body.court_category,
         "court_date": body.court_date,
         "case_number": body.case_number.strip(),
-        "notify_email": body.notify_email.lower(),
+        "notify_email": body.notify_email.lower() if body.notify_email else None,
+        "notify_channels": body.notify_channels or ["email"],
+        "phone": body.phone.strip() if body.phone else None,
         "threshold": body.threshold,
         "active": True,
         "feed_ok": None, "matched": None, "status_key": None, "status_label": None,
