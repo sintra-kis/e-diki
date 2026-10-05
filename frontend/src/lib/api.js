@@ -1,6 +1,7 @@
 import axios from "axios";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+// Empty/unset REACT_APP_BACKEND_URL = same origin (the docker-compose setup proxies /api to the backend).
+const API = `${process.env.REACT_APP_BACKEND_URL ?? ""}/api`;
 
 const api = axios.create({ baseURL: API });
 

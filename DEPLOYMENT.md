@@ -2,6 +2,18 @@
 
 e-dikiΜου = FastAPI backend + MongoDB + React frontend (built to static files).
 
+## 0. Quick start on your own machine/server (Docker)
+
+```bash
+cp backend/.env.example backend/.env      # fill in JWT_SECRET and EMERGENT_EMAIL_KEY (see section 1)
+docker compose up --build                 # MongoDB + backend + nginx/frontend
+# open http://localhost:8080      health: http://localhost:8080/api/health
+```
+
+nginx serves the site and proxies `/api` to the backend, so no `REACT_APP_BACKEND_URL` is needed. For a public server put
+HTTPS in front (Caddy, Traefik or nginx + Let's Encrypt) and set `CORS_ORIGINS` to your domain.
+`docker compose logs -f backend` should show `monitor tick: …` every two minutes once a case exists.
+
 ## 1. Before going live
 
 | Item | How |
