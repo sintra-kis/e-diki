@@ -1,0 +1,61 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# MongoDB is not hosted by Render; point MONGO_URL at e.g. a MongoDB Atlas cluster.
+services:
+  - type: web
+    name: ediki-api
+    runtime: python
+    rootDir: backend
+    # Paid plan on purpose: the case monitor runs inside this process, and free
+    # instances sleep after 15 idle minutes, which would stop notifications.
+    # Keep a single instance so cases are not polled twice.
+    plan: starter
+    numInstances: 1
+    buildCommand: pip install -r requirements.deploy.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.15
+      - key: MONGO_URL
+        sync: false
+      - key: DB_NAME
+        value: ediki
+      - key: JWT_SECRET
+        generateValue: true
+      # Optional: email / SMS / voice notifications stay off when unset.
+      - key: EMERGENT_EMAIL_KEY
+        sync: false
+      - key: EMAIL_REPLY_TO
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+
+  - type: web
+    name: ediki-web
+    runtime: static
+    rootDir: frontend
+    # The @emergentbase/* packages are Emergent editor tooling served from a
+    # private host; craco skips them when absent, so drop them for this build.
+    buildCommand: >-
+      node -e "const f='package.json',p=require('./'+f);
+      for(const s of ['dependencies','devDependencies'])
+      for(const k of Object.keys(p[s]||{}))
+      if(k.startsWith('@emergentbase/'))delete p[s][k];
+      require('fs').writeFileSync(f,JSON.stringify(p,null,2))"
+      && yarn install --non-interactive
+      && CI=false yarn build
+    staticPublishPath: build
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # Public URL of ediki-api, e.g. https://ediki-api.onrender.com (no trailing slash).
+      - key: REACT_APP_BACKEND_URL
+        sync: false
