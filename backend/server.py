@@ -32,7 +32,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field, TypeAdapter, field_validator, model_validator
 
-from docket_logic import analyze
+from docket_logic import analyze, is_primary_match
 
 # ----------------------------------------------------------------------------
 # Config / DB
@@ -290,16 +290,27 @@ async def _warn_unverified(tc: dict) -> None:
         f"εφαρμογή συνεχίζουν κανονικά.")
 
 
-async def dispatch_alert(tc: dict, subject: str, lines: List[str], short_text: str, voice: bool = True):
-    """Send through the chosen channels, but only to contacts the case owner has verified."""
+async def dispatch_alert(tc: dict, subject: str, lines: List[str], short_text: str, voice: bool = True) -> bool:
+    """Send through the chosen channels, but only to contacts the case owner has verified.
+
+    Returns False only when a channel that is configured and allowed was tried and nothing got
+    through, so the caller can retry. Unverified contacts and unconfigured providers are not
+    failures: retrying cannot fix them."""
     channels = tc.get("notify_channels") or ["email"]
     uid = tc.get("user_id")
     skipped = False
+    attempted = delivered = 0
 
     email = (tc.get("notify_email") or "").lower()
     if "email" in channels and email:
         if await is_verified(uid, "email", email):
-            await send_email(to=email, subject=f"[e-dikiΜου] {subject}", html=build_alert_html(subject, lines))
+            if EMAIL_KEY:
+                attempted += 1
+                try:
+                    delivered += bool(await send_email(to=email, subject=f"[e-dikiΜου] {subject}",
+                                                       html=build_alert_html(subject, lines)))
+                except ValueError as e:
+                    logger.error(f"Email blocked by guardrail: {e}")
         else:
             skipped = True
 
@@ -307,14 +318,18 @@ async def dispatch_alert(tc: dict, subject: str, lines: List[str], short_text: s
     wants_phone = phone and ("sms" in channels or ("call" in channels and voice))
     if wants_phone:
         if await is_verified(uid, "phone", phone):
-            if "sms" in channels:
-                await asyncio.to_thread(send_sms, phone, f"e-dikiΜου: {short_text}")
-            if voice and "call" in channels:
-                await asyncio.to_thread(make_call, phone, short_text)
+            if _twilio_client and TWILIO_FROM:
+                if "sms" in channels:
+                    attempted += 1
+                    delivered += bool(await asyncio.to_thread(send_sms, phone, f"e-dikiΜου: {short_text}"))
+                if voice and "call" in channels:
+                    attempted += 1
+                    delivered += bool(await asyncio.to_thread(make_call, phone, short_text))
         else:
             skipped = True
     if skipped:
         await _warn_unverified(tc)
+    return not attempted or delivered > 0
 
 
 # ----------------------------------------------------------------------------
@@ -457,10 +472,16 @@ async def resolve_case(tc: dict, fetched: Optional[DocketFetch] = None) -> dict:
     res = fetched if fetched is not None else await get_dockets(tc)
     if not res.ok:
         return {"feed_ok": False}
+    fallback = None   # matched only by Α/Α serial; used if no docket holds the case number itself
     for docket in res.dockets:
         analysis = analyze(docket, tc["case_number"], STUCK_MINUTES)
-        if analysis:
+        if not analysis:
+            continue
+        if any(is_primary_match(tc["case_number"], c) for c in docket.get("docketCases") or []):
             return {"feed_ok": True, **analysis}
+        fallback = fallback or analysis
+    if fallback:
+        return {"feed_ok": True, **fallback}
     return {"feed_ok": not res.incomplete, "matched": False}
 
 
@@ -586,7 +607,8 @@ async def _evaluate_locked(tc: dict, fetched: Optional[DocketFetch] = None):
                            f"Η υπόθεση {tc.get('case_number')} είναι πλέον: {live['status_label']}.", True))
 
     # 2. approaching its turn (first time within the threshold)
-    if waiting and live.get("started") and remaining <= threshold and not tc.get("notified_approaching"):
+    court_day = _is_court_day(tc)
+    if waiting and live.get("started") and court_day and remaining <= threshold and not tc.get("notified_approaching"):
         title = "Η υπόθεσή σας πλησιάζει!"
         msg = (f"{remaining_phrase(remaining)} πριν από τη δική σας "
                f"({case_tag(tc)}, σειρά #{live.get('target_serial')}). "
@@ -618,7 +640,7 @@ async def _evaluate_locked(tc: dict, fetched: Optional[DocketFetch] = None):
                       f"Για την υπόθεσή σας (#{live.get('target_serial')}): {ahead_detail(live)}."))
 
     # 4. stuck docket
-    if live.get("stuck") and not tc.get("notified_stuck"):
+    if live.get("stuck") and court_day and not tc.get("notified_stuck"):
         title = "Προσοχή: το πινάκιο φαίνεται στάσιμο"
         msg = (f"Το πινάκιο {live.get('docket_code') or ''} στο {live.get('court_name')} δεν έχει "
                f"ενημερωθεί για πάνω από {STUCK_MINUTES} λεπτά, ενώ η υπόθεσή σας "
@@ -638,11 +660,96 @@ async def _evaluate_locked(tc: dict, fetched: Optional[DocketFetch] = None):
     await _emit(tc, notes, alerts)
 
 
+ALERT_MAX_TRIES = 3
+
+
 async def _emit(tc: dict, notes: list, alerts: list):
     for ntype, title, msg in notes:
         await create_notification(tc, ntype, title, msg)
+    # Alerts that could not be delivered stay on the case and are retried on the next checks,
+    # so a momentary email/SMS outage cannot swallow the one "your turn is near" message.
+    pending = list(tc.get("pending_alerts") or [])
+    still_pending = []
+    for p in pending:
+        ok = await dispatch_alert(tc, p["subject"], p["lines"], p["short"], voice=p["voice"])
+        if ok is False and p.get("tries", 1) < ALERT_MAX_TRIES:
+            still_pending.append({**p, "tries": p.get("tries", 1) + 1})
     for subject, lines, short, voice in alerts:
-        await dispatch_alert(tc, subject, lines, short, voice=voice)
+        ok = await dispatch_alert(tc, subject, lines, short, voice=voice)
+        if ok is False:
+            still_pending.append({"subject": subject, "lines": lines, "short": short, "voice": voice, "tries": 1})
+    if still_pending != pending:
+        await db.tracked_cases.update_one({"id": tc["id"]}, {"$set": {"pending_alerts": still_pending}})
+
+
+FUTURE_CHECK_MINUTES = int(os.environ.get('FUTURE_CHECK_MINUTES', '30'))
+WORKER_ID = uuid.uuid4().hex
+LEASE_SECONDS = max(3 * MONITOR_INTERVAL, 60)
+
+
+async def acquire_monitor_lease() -> bool:
+    """Only one worker/process runs the monitor at a time.
+
+    A lease document is taken (or renewed by its owner) with an atomic upsert: if another
+    worker holds an unexpired lease the filter misses, the upsert collides on _id and we
+    stay passive. A crashed leader is replaced once its lease expires.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        await db.locks.find_one_and_update(
+            {"_id": "monitor", "$or": [{"owner": WORKER_ID}, {"expires_at": {"$lt": now.isoformat()}}]},
+            {"$set": {"owner": WORKER_ID, "expires_at": (now + timedelta(seconds=LEASE_SECONDS)).isoformat()}},
+            upsert=True)
+        return True
+    except DuplicateKeyError:
+        return False
+
+
+async def release_monitor_lease() -> None:
+    await db.locks.update_one({"_id": "monitor", "owner": WORKER_ID},
+                              {"$set": {"expires_at": datetime.now(timezone.utc).isoformat()}})
+
+
+def _today_athens() -> str:
+    return datetime.now(ATHENS).date().isoformat()
+
+
+async def monitor_tick():
+    """One pass over all active cases.
+
+    - hearings in the past are retired (they would otherwise be polled forever);
+    - hearings on a later day are only re-checked every FUTURE_CHECK_MINUTES;
+    - the rest are grouped by court query: each group reads e-diki once and every case in
+      it is evaluated against that single result, groups running concurrently (the global
+      semaphore in ediki_get bounds the real request rate).
+    """
+    today = _today_athens()
+    now = datetime.now(timezone.utc)
+    future_gap = (now - timedelta(minutes=FUTURE_CHECK_MINUTES)).isoformat()
+    groups: dict = {}
+    for tc in await db.tracked_cases.find({"active": True}).to_list(None):
+        day = tc.get("court_date") or ""
+        if day < today:
+            await db.tracked_cases.update_one({"id": tc["id"]}, {"$set": {"active": False, "expired": True}})
+            continue
+        if day > today and (tc.get("last_checked") or "") > future_gap:
+            continue
+        groups.setdefault(group_key(tc), []).append(tc)
+
+    async def run_group(tcs: list):
+        try:
+            fetched = await get_dockets(tcs[0], force=True)
+        except Exception as e:
+            logger.error(f"docket fetch error {group_key(tcs[0])}: {e}")
+            fetched = DocketFetch(ok=False)
+        for tc in tcs:
+            try:
+                await evaluate_case(tc, fetched)
+            except Exception as e:   # one bad case must not stop the others
+                logger.error(f"evaluate_case error {tc.get('id')}: {e}")
+
+    await asyncio.gather(*(run_group(g) for g in groups.values()))
+    return {"cases": sum(len(g) for g in groups.values()), "groups": len(groups)}
 
 
 FUTURE_CHECK_MINUTES = int(os.environ.get('FUTURE_CHECK_MINUTES', '30'))
@@ -1004,10 +1111,12 @@ async def verify_contact(body: ContactVerifyIn, user=Depends(get_current_user)):
     now = _iso(datetime.now(timezone.utc))
     if not ch or ch.get("used") or ch["expires_at"] < now:
         raise HTTPException(status_code=400, detail="Ο κωδικός έληξε ή δεν υπάρχει. Ζητήστε νέο")
-    if ch["attempts"] >= CODE_MAX_ATTEMPTS:
+    # Claim an attempt atomically: parallel guesses cannot all slip past the limit.
+    claimed = await db.contact_challenges.find_one_and_update(
+        {"id": ch["id"], "used": False, "attempts": {"$lt": CODE_MAX_ATTEMPTS}}, {"$inc": {"attempts": 1}})
+    if not claimed:
         raise HTTPException(status_code=429, detail="Πολλές αποτυχημένες προσπάθειες. Ζητήστε νέο κωδικό")
     if not hmac.compare_digest(ch["code_hash"], _code_hash(ch["id"], body.code.strip())):
-        await db.contact_challenges.update_one({"id": ch["id"]}, {"$inc": {"attempts": 1}})
         raise HTTPException(status_code=400, detail="Λάθος κωδικός")
     await db.contact_challenges.update_one({"id": ch["id"]}, {"$set": {"used": True}})
     await db.verified_contacts.update_one(
@@ -1051,8 +1160,17 @@ async def require_verified_contacts(user_id: str, body: "TrackIn") -> None:
 # ----------------------------------------------------------------------------
 # Tracked cases
 # ----------------------------------------------------------------------------
-def public_case(tc: dict) -> dict:
+PRIVATE_CASE_FIELDS = ("notify_email", "phone", "notify_channels", "pending_alerts")
+
+
+def public_case(tc: dict, viewer_id: Optional[str] = None) -> dict:
+    """Group members see each other's cases, but never each other's contact details."""
     tc.pop("_id", None)
+    if viewer_id is not None and tc.get("user_id") != viewer_id:
+        for f in PRIVATE_CASE_FIELDS:
+            tc.pop(f, None)
+    else:
+        tc.pop("pending_alerts", None)
     return tc
 
 
@@ -1066,6 +1184,11 @@ async def add_case(body: TrackIn, user=Depends(get_current_user)):
     if body.group_id and body.group_id not in await user_group_ids(user):
         raise HTTPException(status_code=403, detail="Δεν ανήκετε σε αυτή την ομάδα")
     await require_verified_contacts(user["id"], body)
+    # Kind/category are left out on purpose: the first check overwrites them with e-diki's values.
+    dup = {"user_id": user["id"], "court_type": body.court_type, "court_name": body.court_name,
+           "court_date": body.court_date, "case_number": body.case_number.strip()}
+    if await db.tracked_cases.find_one(dup):
+        raise HTTPException(status_code=409, detail="Παρακολουθείτε ήδη αυτή την υπόθεση")
     tc = {
         "id": str(uuid.uuid4()),
         "user_id": user["id"],
@@ -1094,7 +1217,7 @@ async def add_case(body: TrackIn, user=Depends(get_current_user)):
     except Exception as e:
         logger.error(f"initial evaluate error: {e}")
     fresh = await db.tracked_cases.find_one({"id": tc["id"]})
-    return public_case(fresh)
+    return public_case(fresh, user["id"])
 
 
 @api.get("/cases")
@@ -1102,7 +1225,7 @@ async def list_cases(user=Depends(get_current_user)):
     gids = await user_group_ids(user)
     query = {"$or": [{"user_id": user["id"]}, {"group_id": {"$in": gids}}]} if gids else {"user_id": user["id"]}
     cases = await db.tracked_cases.find(query).sort("created_at", -1).to_list(1000)
-    return [public_case(c) for c in cases]
+    return [public_case(c, user["id"]) for c in cases]
 
 
 async def _owned_case(case_id: str, user) -> dict:
@@ -1119,7 +1242,7 @@ async def _owned_case(case_id: str, user) -> dict:
 async def refresh_case(case_id: str, user=Depends(get_current_user)):
     tc = await _owned_case(case_id, user)
     await evaluate_case(tc)
-    return public_case(await db.tracked_cases.find_one({"id": case_id}))
+    return public_case(await db.tracked_cases.find_one({"id": case_id}), user["id"])
 
 
 @api.delete("/cases/{case_id}")

@@ -69,8 +69,11 @@ class Col:
     async def find_one_and_update(self, q, upd, upsert=False):
         for d in self.docs:
             if self._match(d, q):
+                before = dict(d)
                 d.update(upd.get("$set", {}))
-                return dict(d)
+                for k, n in upd.get("$inc", {}).items():
+                    d[k] = d.get(k, 0) + n
+                return before
         if upsert:
             new = {k: v for k, v in q.items() if not k.startswith("$")}
             if "_id" in new and any(x.get("_id") == new["_id"] for x in self.docs):

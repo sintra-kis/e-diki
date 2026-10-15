@@ -80,7 +80,11 @@ def sent(db, monkeypatch):
 
     async def email(*, to, subject, html):
         out.append(("email", to))
+        return "msg-id"
 
+    monkeypatch.setattr(server, "EMAIL_KEY", "k")
+    monkeypatch.setattr(server, "_twilio_client", object())
+    monkeypatch.setattr(server, "TWILIO_FROM", "+10000000000")
     monkeypatch.setattr(server, "send_email", email)
     monkeypatch.setattr(server, "send_sms", lambda to, text: out.append(("sms", to)) or True)
     monkeypatch.setattr(server, "make_call", lambda to, text: out.append(("call", to)) or True)
