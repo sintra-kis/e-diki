@@ -7,8 +7,6 @@ import { formatDate } from "@/lib/utils";
 
 const casesWord = (n) => (n === 1 ? "υπόθεση μπροστά" : "υποθέσεις μπροστά");
 
-const casesWord = (n) => (n === 1 ? "υπόθεση μπροστά" : "υποθέσεις μπροστά");
-
 function Ahead({ c }) {
   const k = statusOf(c);
   if (k === "dikazetai") return <span className="text-amber-600 font-semibold">Δικάζεται τώρα</span>;
