@@ -752,6 +752,76 @@ async def monitor_tick():
     return {"cases": sum(len(g) for g in groups.values()), "groups": len(groups)}
 
 
+FUTURE_CHECK_MINUTES = int(os.environ.get('FUTURE_CHECK_MINUTES', '30'))
+WORKER_ID = uuid.uuid4().hex
+LEASE_SECONDS = max(3 * MONITOR_INTERVAL, 60)
+
+
+async def acquire_monitor_lease() -> bool:
+    """Only one worker/process runs the monitor at a time.
+
+    A lease document is taken (or renewed by its owner) with an atomic upsert: if another
+    worker holds an unexpired lease the filter misses, the upsert collides on _id and we
+    stay passive. A crashed leader is replaced once its lease expires.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        await db.locks.find_one_and_update(
+            {"_id": "monitor", "$or": [{"owner": WORKER_ID}, {"expires_at": {"$lt": now.isoformat()}}]},
+            {"$set": {"owner": WORKER_ID, "expires_at": (now + timedelta(seconds=LEASE_SECONDS)).isoformat()}},
+            upsert=True)
+        return True
+    except DuplicateKeyError:
+        return False
+
+
+async def release_monitor_lease() -> None:
+    await db.locks.update_one({"_id": "monitor", "owner": WORKER_ID},
+                              {"$set": {"expires_at": datetime.now(timezone.utc).isoformat()}})
+
+
+def _today_athens() -> str:
+    return datetime.now(ATHENS).date().isoformat()
+
+
+async def monitor_tick():
+    """One pass over all active cases.
+
+    - hearings in the past are retired (they would otherwise be polled forever);
+    - hearings on a later day are only re-checked every FUTURE_CHECK_MINUTES;
+    - the rest are grouped by court query: each group reads e-diki once and every case in
+      it is evaluated against that single result, groups running concurrently (the global
+      semaphore in ediki_get bounds the real request rate).
+    """
+    today = _today_athens()
+    now = datetime.now(timezone.utc)
+    future_gap = (now - timedelta(minutes=FUTURE_CHECK_MINUTES)).isoformat()
+    groups: dict = {}
+    for tc in await db.tracked_cases.find({"active": True}).to_list(None):
+        day = tc.get("court_date") or ""
+        if day < today:
+            await db.tracked_cases.update_one({"id": tc["id"]}, {"$set": {"active": False, "expired": True}})
+            continue
+        if day > today and (tc.get("last_checked") or "") > future_gap:
+            continue
+        groups.setdefault(group_key(tc), []).append(tc)
+
+    async def run_group(tcs: list):
+        try:
+            fetched = await get_dockets(tcs[0], force=True)
+        except Exception as e:
+            logger.error(f"docket fetch error {group_key(tcs[0])}: {e}")
+            fetched = DocketFetch(ok=False)
+        for tc in tcs:
+            try:
+                await evaluate_case(tc, fetched)
+            except Exception as e:   # one bad case must not stop the others
+                logger.error(f"evaluate_case error {tc.get('id')}: {e}")
+
+    await asyncio.gather(*(run_group(g) for g in groups.values()))
+    return {"cases": sum(len(g) for g in groups.values()), "groups": len(groups)}
+
+
 async def monitor_loop():
     await asyncio.sleep(5)
     while True:
