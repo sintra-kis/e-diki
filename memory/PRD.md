@@ -27,3 +27,10 @@ Web app "e-dikiΜου" (Greek UI) for lawyers to track court cause lists (πιν
 - Richer offense/subject detail via getCaseDetailsPublic where available.
 - Per-case notification history view & email open tracking.
 - Group management (leave group, remove member, rename).
+
+## Hardening & efficiency pass (2026-10-15)
+- Security: group codes are 8 hex chars with a join rate limit; group members no longer see each other's email/phone; OTP attempt limit is atomic; login/register/join are rate-limited; malformed JWT → 401; notifications can only be marked read by their owner/group.
+- Correctness: a docket counts as "started" only once a case left "waiting" (a bare timestamp no longer triggers stuck/approaching); "approaching"/"stuck" alerts only on the hearing day; a case-number match in any docket beats an Α/Α-only match; duplicate tracking → 409; undelivered alerts are retried (3 tries) instead of being lost.
+- Efficiency: docket reads are shared (15 s cache + in-flight dedupe); monitor checks only today's cases, in parallel (MONITOR_CONCURRENCY=5), retires cases after their day, no 1000-case cap; extra Mongo indexes; FastAPI lifespan instead of deprecated on_event.
+- Frontend: local-date formatting, stale dropdown responses ignored.
+- Tests: tests/test_hardening.py, tests/test_e2e_api.py (needs `mongomock-motor`, skipped if missing).

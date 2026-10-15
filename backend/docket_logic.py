@@ -52,6 +52,11 @@ def case_number_matches(entered: str, case: dict, fields=_PRIMARY_FIELDS + _SERI
     return any(_clean(case.get(f)) == e for f in fields)
 
 
+def is_primary_match(entered: str, case: dict) -> bool:
+    """True when the number matches a case-number field (not just the Α/Α serial)."""
+    return case_number_matches(entered, case, _PRIMARY_FIELDS)
+
+
 def find_case(cases: list, entered: str) -> Optional[dict]:
     """Case-number fields win over the Α/Α serial; first exact match in docket order."""
     for fields in (_PRIMARY_FIELDS, _SERIAL_FIELDS):
@@ -127,7 +132,9 @@ def analyze(docket: dict, entered_number: str, stuck_minutes: int = 20, now: Opt
 
     remaining = waiting_ahead + paused_ahead
     last_update = max_ts(docket)
-    started = last_update is not None or any_started
+    # A docket counts as started only once some case actually left "waiting". A bare timestamp
+    # is not proof: it can be stamped when the list is published, long before the hearing.
+    started = any_started
     now = now or datetime.now(timezone.utc)
     stuck = bool(started and tkey in STILL_AHEAD and remaining > 0 and last_update is not None
                  and now - last_update > timedelta(minutes=stuck_minutes))

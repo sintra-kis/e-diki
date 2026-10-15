@@ -6,6 +6,7 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 import asyncio
+import collections
 import hashlib
 import hmac
 import logging
@@ -24,12 +25,14 @@ import bcrypt
 import jwt
 import httpx
 from bson import ObjectId
+from bson.errors import InvalidId
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field, TypeAdapter, field_validator, model_validator
 
-from docket_logic import analyze
+from docket_logic import analyze, is_primary_match
 
 # ----------------------------------------------------------------------------
 # Config / DB
@@ -66,7 +69,16 @@ if TWILIO_SID and TWILIO_TOKEN:
     except Exception as e:
         logger.error(f"Twilio init failed: {e}")
 
-app = FastAPI(title="e-dikiΜου")
+@asynccontextmanager
+async def lifespan(_app):
+    await startup()
+    try:
+        yield
+    finally:
+        await shutdown()
+
+
+app = FastAPI(title="e-dikiΜου", lifespan=lifespan)
 api = APIRouter(prefix="/api")
 
 
@@ -90,6 +102,28 @@ def create_access_token(user_id: str, email: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
+# Sliding-window rate limiter (per process; the app runs as a single instance).
+_hits: dict = {}
+
+
+def rate_limit(key: str, limit: int, window_s: int, detail: str = "Πολλές προσπάθειες. Δοκιμάστε αργότερα") -> None:
+    now = datetime.now(timezone.utc).timestamp()
+    q = _hits.setdefault(key, collections.deque())
+    while q and q[0] <= now - window_s:
+        q.popleft()
+    if len(q) >= limit:
+        raise HTTPException(status_code=429, detail=detail)
+    q.append(now)
+    if len(_hits) > 5000:  # drop idle keys so the map cannot grow without bound
+        for k in [k for k, v in _hits.items() if not v or v[-1] <= now - 3600]:
+            _hits.pop(k, None)
+
+
+def client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    return fwd.split(",")[0].strip() or (request.client.host if request.client else "?")
+
+
 async def get_current_user(request: Request) -> dict:
     auth_header = request.headers.get("Authorization", "")
     token = auth_header[7:] if auth_header.startswith("Bearer ") else request.cookies.get("access_token")
@@ -106,7 +140,7 @@ async def get_current_user(request: Request) -> dict:
         return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Η συνεδρία έληξε")
-    except jwt.InvalidTokenError:
+    except (jwt.InvalidTokenError, InvalidId, KeyError, TypeError):
         raise HTTPException(status_code=401, detail="Μη έγκυρο token")
 
 
@@ -270,16 +304,27 @@ def make_call(to: str, text: str) -> bool:
         return False
 
 
-async def dispatch_alert(tc: dict, subject: str, lines: List[str], short_text: str, voice: bool = True):
+async def dispatch_alert(tc: dict, subject: str, lines: List[str], short_text: str, voice: bool = True) -> bool:
+    """Send an alert on every selected channel. Returns False only when channels that are
+    actually configured were tried and none got through, so the caller can retry."""
     channels = tc.get("notify_channels") or ["email"]
-    if "email" in channels and tc.get("notify_email"):
-        await send_email(to=tc["notify_email"], subject=f"[e-dikiΜου] {subject}",
-                         html=build_alert_html(subject, lines))
+    attempted, delivered = 0, 0
+    if "email" in channels and tc.get("notify_email") and EMAIL_KEY:
+        attempted += 1
+        try:
+            delivered += bool(await send_email(to=tc["notify_email"], subject=f"[e-dikiΜου] {subject}",
+                                               html=build_alert_html(subject, lines)))
+        except ValueError as e:
+            logger.error(f"Email blocked by guardrail: {e}")
+    twilio_ready = bool(_twilio_client and TWILIO_FROM)
     phone = tc.get("phone")
-    if phone and "sms" in channels:
-        await asyncio.to_thread(send_sms, phone, f"e-dikiΜου: {short_text}")
-    if phone and voice and "call" in channels:
-        await asyncio.to_thread(make_call, phone, short_text)
+    if phone and "sms" in channels and twilio_ready:
+        attempted += 1
+        delivered += bool(await asyncio.to_thread(send_sms, phone, f"e-dikiΜου: {short_text}"))
+    if phone and voice and "call" in channels and twilio_ready:
+        attempted += 1
+        delivered += bool(await asyncio.to_thread(make_call, phone, short_text))
+    return not attempted or delivered > 0
 
 
 # ----------------------------------------------------------------------------
@@ -305,6 +350,34 @@ async def ediki_get(path: str, params: dict) -> Optional[object]:
     except Exception as e:
         logger.error(f"e-diki fetch failed {path}: {e}")
         return None
+
+
+# Short-lived shared cache for docket reads. Many tracked cases sit in the same docket, so one
+# monitor round would otherwise download it once per case. Concurrent identical reads share a
+# single in-flight request; only successful answers are cached.
+_SHARED_TTL = 15
+_shared: dict = {}
+_inflight: dict = {}
+
+
+async def ediki_get_shared(path: str, params: dict) -> Optional[object]:
+    key = (path, tuple(sorted((k, str(v)) for k, v in params.items() if v not in (None, ""))))
+    now = datetime.now(timezone.utc).timestamp()
+    hit = _shared.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    task = _inflight.get(key)
+    if task is None:
+        task = asyncio.ensure_future(ediki_get(path, params))
+        _inflight[key] = task
+        task.add_done_callback(lambda _t, k=key: _inflight.pop(k, None))
+    data = await asyncio.shield(task)
+    if data is not None:
+        _shared[key] = (now + _SHARED_TTL, data)
+        if len(_shared) > 400:
+            for k in [k for k, v in _shared.items() if v[0] <= now]:
+                _shared.pop(k, None)
+    return data
 
 
 # Dropdown options (courts, kinds, categories) change rarely; cache them briefly.
@@ -353,23 +426,30 @@ async def resolve_case(tc: dict) -> dict:
         "size": DOCKET_PAGE_SIZE,
     }
     incomplete = False
+    fallback = None  # matched only by Α/Α serial; used if no docket holds the case number itself
     for page in range(DOCKET_MAX_PAGES):
-        listing = await ediki_get("/public/dockets", {**params, "page": page})
+        listing = await ediki_get_shared("/public/dockets", {**params, "page": page})
         if not isinstance(listing, dict):
             return {"feed_ok": False}
         content = listing.get("content") or []
         for d in content:
-            full = await ediki_get("/public/dockets", {"id": d["id"]})
+            full = await ediki_get_shared("/public/dockets", {"id": d["id"]})
             if not full or not full.get("content"):
                 incomplete = True
                 continue
-            analysis = analyze(full["content"][0], tc["case_number"], STUCK_MINUTES)
-            if analysis:
+            docket = full["content"][0]
+            analysis = analyze(docket, tc["case_number"], STUCK_MINUTES)
+            if not analysis:
+                continue
+            if any(is_primary_match(tc["case_number"], c) for c in docket.get("docketCases") or []):
                 return {"feed_ok": True, **analysis}
+            fallback = fallback or analysis
         total_pages = listing.get("totalPages")
         if listing.get("last") is True or len(content) < DOCKET_PAGE_SIZE or \
                 (isinstance(total_pages, int) and page + 1 >= total_pages):
             break
+    if fallback:
+        return {"feed_ok": True, **fallback}
     return {"feed_ok": not incomplete, "matched": False}
 
 
@@ -490,7 +570,8 @@ async def _evaluate_locked(tc: dict):
                            f"Η υπόθεση {tc.get('case_number')} είναι πλέον: {live['status_label']}.", True))
 
     # 2. approaching its turn (first time within the threshold)
-    if waiting and live.get("started") and remaining <= threshold and not tc.get("notified_approaching"):
+    court_day = _is_court_day(tc)
+    if waiting and live.get("started") and court_day and remaining <= threshold and not tc.get("notified_approaching"):
         title = "Η υπόθεσή σας πλησιάζει!"
         msg = (f"Απομένουν {remaining} υποθέσεις πριν από τη δική σας "
                f"({case_tag(tc)}, σειρά #{live.get('target_serial')}). "
@@ -522,7 +603,7 @@ async def _evaluate_locked(tc: dict):
                       f"Για την υπόθεσή σας (#{live.get('target_serial')}): {ahead_detail(live)}."))
 
     # 4. stuck docket
-    if live.get("stuck") and not tc.get("notified_stuck"):
+    if live.get("stuck") and court_day and not tc.get("notified_stuck"):
         title = "Προσοχή: το πινάκιο φαίνεται στάσιμο"
         msg = (f"Το πινάκιο {live.get('docket_code') or ''} στο {live.get('court_name')} δεν έχει "
                f"ενημερωθεί για πάνω από {STUCK_MINUTES} λεπτά, ενώ η υπόθεσή σας "
@@ -542,23 +623,56 @@ async def _evaluate_locked(tc: dict):
     await _emit(tc, notes, alerts)
 
 
+ALERT_MAX_TRIES = 3
+
+
 async def _emit(tc: dict, notes: list, alerts: list):
     for ntype, title, msg in notes:
         await create_notification(tc, ntype, title, msg)
+    # Alerts that could not be delivered are kept on the case and retried on the next checks,
+    # so a momentary email/SMS outage cannot swallow the one "your turn is near" message.
+    pending = list(tc.get("pending_alerts") or [])
+    still_pending = []
+    for p in pending:
+        ok = await dispatch_alert(tc, p["subject"], p["lines"], p["short"], voice=p["voice"])
+        if ok is False and p.get("tries", 1) < ALERT_MAX_TRIES:
+            still_pending.append({**p, "tries": p.get("tries", 1) + 1})
     for subject, lines, short, voice in alerts:
-        await dispatch_alert(tc, subject, lines, short, voice=voice)
+        ok = await dispatch_alert(tc, subject, lines, short, voice=voice)
+        if ok is False:
+            still_pending.append({"subject": subject, "lines": lines, "short": short, "voice": voice, "tries": 1})
+    if still_pending != pending:
+        await db.tracked_cases.update_one({"id": tc["id"]}, {"$set": {"pending_alerts": still_pending}})
+
+
+MONITOR_CONCURRENCY = int(os.environ.get('MONITOR_CONCURRENCY', '5'))
+
+
+async def _safe_evaluate(tc: dict, sem: asyncio.Semaphore):
+    async with sem:
+        try:
+            await evaluate_case(tc)
+        except Exception as e:
+            logger.error(f"evaluate_case error {tc.get('id')}: {e}")
+
+
+async def monitor_once():
+    """One monitoring round: retire cases whose hearing day has passed, then check today's
+    cases in parallel (bounded). Cases for future dates are checked when they are added and
+    again on their day, instead of hitting e-diki every round for days on end."""
+    today = datetime.now(ATHENS).date().isoformat()
+    await db.tracked_cases.update_many({"active": True, "court_date": {"$lt": today}},
+                                       {"$set": {"active": False, "ended_reason": "expired"}})
+    cases = await db.tracked_cases.find({"active": True, "court_date": {"$lte": today}}).to_list(None)
+    sem = asyncio.Semaphore(MONITOR_CONCURRENCY)
+    await asyncio.gather(*(_safe_evaluate(tc, sem) for tc in cases))
 
 
 async def monitor_loop():
     await asyncio.sleep(5)
     while True:
         try:
-            cases = await db.tracked_cases.find({"active": True}).to_list(1000)
-            for tc in cases:
-                try:
-                    await evaluate_case(tc)
-                except Exception as e:
-                    logger.error(f"evaluate_case error {tc.get('id')}: {e}")
+            await monitor_once()
         except Exception as e:
             logger.error(f"monitor loop error: {e}")
         await asyncio.sleep(MONITOR_INTERVAL)
@@ -635,7 +749,8 @@ class JoinGroupIn(BaseModel):
 # Auth routes
 # ----------------------------------------------------------------------------
 @api.post("/auth/register")
-async def register(body: RegisterIn):
+async def register(body: RegisterIn, request: Request):
+    rate_limit(f"register:{client_ip(request)}", 10, 3600)
     email = body.email.lower()
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Το email χρησιμοποιείται ήδη")
@@ -648,8 +763,10 @@ async def register(body: RegisterIn):
 
 
 @api.post("/auth/login")
-async def login(body: LoginIn):
+async def login(body: LoginIn, request: Request):
     email = body.email.lower()
+    rate_limit(f"login:{email}", 10, 900)
+    rate_limit(f"login-ip:{client_ip(request)}", 60, 900)
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Λάθος email ή κωδικός")
@@ -792,10 +909,12 @@ async def verify_contact(body: ContactVerifyIn, user=Depends(get_current_user)):
     now = _iso(datetime.now(timezone.utc))
     if not ch or ch.get("used") or ch["expires_at"] < now:
         raise HTTPException(status_code=400, detail="Ο κωδικός έληξε ή δεν υπάρχει. Ζητήστε νέο")
-    if ch["attempts"] >= CODE_MAX_ATTEMPTS:
+    # Claim an attempt atomically: parallel guesses cannot all slip past the limit.
+    claimed = await db.contact_challenges.find_one_and_update(
+        {"id": ch["id"], "used": False, "attempts": {"$lt": CODE_MAX_ATTEMPTS}}, {"$inc": {"attempts": 1}})
+    if not claimed:
         raise HTTPException(status_code=429, detail="Πολλές αποτυχημένες προσπάθειες. Ζητήστε νέο κωδικό")
     if not hmac.compare_digest(ch["code_hash"], _code_hash(ch["id"], body.code.strip())):
-        await db.contact_challenges.update_one({"id": ch["id"]}, {"$inc": {"attempts": 1}})
         raise HTTPException(status_code=400, detail="Λάθος κωδικός")
     await db.contact_challenges.update_one({"id": ch["id"]}, {"$set": {"used": True}})
     await db.verified_contacts.update_one(
@@ -824,8 +943,17 @@ async def require_verified_contacts(user_id: str, body: "TrackIn") -> None:
 # ----------------------------------------------------------------------------
 # Tracked cases
 # ----------------------------------------------------------------------------
-def public_case(tc: dict) -> dict:
+PRIVATE_CASE_FIELDS = ("notify_email", "phone", "notify_channels", "pending_alerts")
+
+
+def public_case(tc: dict, viewer_id: Optional[str] = None) -> dict:
+    """Group members see each other's cases, but never each other's contact details."""
     tc.pop("_id", None)
+    if viewer_id is not None and tc.get("user_id") != viewer_id:
+        for f in PRIVATE_CASE_FIELDS:
+            tc.pop(f, None)
+    else:
+        tc.pop("pending_alerts", None)
     return tc
 
 
@@ -839,6 +967,11 @@ async def add_case(body: TrackIn, user=Depends(get_current_user)):
     if body.group_id and body.group_id not in await user_group_ids(user):
         raise HTTPException(status_code=403, detail="Δεν ανήκετε σε αυτή την ομάδα")
     await require_verified_contacts(user["id"], body)
+    # Kind/category are left out on purpose: the first check overwrites them with e-diki's values.
+    dup = {"user_id": user["id"], "court_type": body.court_type, "court_name": body.court_name,
+           "court_date": body.court_date, "case_number": body.case_number.strip()}
+    if await db.tracked_cases.find_one(dup):
+        raise HTTPException(status_code=409, detail="Παρακολουθείτε ήδη αυτή την υπόθεση")
     tc = {
         "id": str(uuid.uuid4()),
         "user_id": user["id"],
@@ -867,7 +1000,7 @@ async def add_case(body: TrackIn, user=Depends(get_current_user)):
     except Exception as e:
         logger.error(f"initial evaluate error: {e}")
     fresh = await db.tracked_cases.find_one({"id": tc["id"]})
-    return public_case(fresh)
+    return public_case(fresh, user["id"])
 
 
 @api.get("/cases")
@@ -875,7 +1008,7 @@ async def list_cases(user=Depends(get_current_user)):
     gids = await user_group_ids(user)
     query = {"$or": [{"user_id": user["id"]}, {"group_id": {"$in": gids}}]} if gids else {"user_id": user["id"]}
     cases = await db.tracked_cases.find(query).sort("created_at", -1).to_list(1000)
-    return [public_case(c) for c in cases]
+    return [public_case(c, user["id"]) for c in cases]
 
 
 async def _owned_case(case_id: str, user) -> dict:
@@ -892,7 +1025,7 @@ async def _owned_case(case_id: str, user) -> dict:
 async def refresh_case(case_id: str, user=Depends(get_current_user)):
     tc = await _owned_case(case_id, user)
     await evaluate_case(tc)
-    return public_case(await db.tracked_cases.find_one({"id": case_id}))
+    return public_case(await db.tracked_cases.find_one({"id": case_id}), user["id"])
 
 
 @api.delete("/cases/{case_id}")
@@ -923,7 +1056,9 @@ async def list_notifications(user=Depends(get_current_user)):
 
 @api.post("/notifications/{note_id}/read")
 async def read_notification(note_id: str, user=Depends(get_current_user)):
-    await db.notifications.update_one({"id": note_id}, {"$set": {"read": True}})
+    gids = await user_group_ids(user)
+    mine = [{"user_id": user["id"]}] + ([{"group_id": {"$in": gids}}] if gids else [])
+    await db.notifications.update_one({"id": note_id, "$or": mine}, {"$set": {"read": True}})
     return {"ok": True}
 
 
@@ -940,7 +1075,7 @@ async def read_all(user=Depends(get_current_user)):
 # ----------------------------------------------------------------------------
 @api.post("/groups")
 async def create_group(body: GroupIn, user=Depends(get_current_user)):
-    code = uuid.uuid4().hex[:6].upper()
+    code = secrets.token_hex(4).upper()  # 8 hex chars, unguessable in practice
     g = {"id": str(uuid.uuid4()), "name": body.name, "code": code,
          "owner_id": user["id"], "member_ids": [user["id"]],
          "created_at": datetime.now(timezone.utc).isoformat()}
@@ -952,7 +1087,8 @@ async def create_group(body: GroupIn, user=Depends(get_current_user)):
 
 @api.post("/groups/join")
 async def join_group(body: JoinGroupIn, user=Depends(get_current_user)):
-    g = await db.groups.find_one({"code": body.code.upper()})
+    rate_limit(f"join:{user['id']}", 10, 3600, "Πολλές προσπάθειες με λάθος κωδικό ομάδας. Δοκιμάστε αργότερα")
+    g = await db.groups.find_one({"code": body.code.strip().upper()})
     if not g:
         raise HTTPException(status_code=404, detail="Λάθος κωδικός ομάδας")
     await db.groups.update_one({"id": g["id"]}, {"$addToSet": {"member_ids": user["id"]}})
@@ -988,20 +1124,29 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
+_monitor_task: Optional[asyncio.Task] = None
+
+
 async def startup():
     await db.users.create_index("email", unique=True)
     await db.verified_contacts.create_index([("user_id", 1), ("kind", 1), ("value", 1)], unique=True)
     await db.contact_challenges.create_index([("user_id", 1), ("kind", 1), ("value", 1), ("created_at", -1)])
     await db.contact_challenges.create_index("created_at")
     await db.tracked_cases.create_index("id", unique=True)
+    await db.tracked_cases.create_index([("active", 1), ("court_date", 1)])
+    await db.tracked_cases.create_index("user_id")
+    await db.tracked_cases.create_index("group_id")
+    await db.notifications.create_index([("user_id", 1), ("created_at", -1)])
+    await db.groups.create_index("code", unique=True)
     await db.notifications.create_index("id", unique=True)
-    asyncio.create_task(monitor_loop())
+    global _monitor_task
+    _monitor_task = asyncio.create_task(monitor_loop())
     logger.info("e-dikiΜου started; monitor interval=%ss", MONITOR_INTERVAL)
 
 
-@app.on_event("shutdown")
 async def shutdown():
+    if _monitor_task is not None:
+        _monitor_task.cancel()
     if _http is not None:
         await _http.aclose()
     client.close()

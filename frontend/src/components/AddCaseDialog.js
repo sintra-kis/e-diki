@@ -45,10 +45,12 @@ export default function AddCaseDialog({ open, onClose, onAdded, groups, defaultE
     upd("court_name", ""); upd("court_kind", ""); upd("court_category", "");
     if (!f.court_type) return;
     setLoading((l) => ({ ...l, names: true }));
+    let stale = false; // a slower, older answer must not overwrite the current selection
     api.get("/ediki/court-names", { params: { courtType: f.court_type, date: f.court_date || undefined } })
-      .then((r) => setNames(r.data || []))
-      .catch(() => { setNames([]); toast.error("Δεν ήταν δυνατή η φόρτωση των καταστημάτων από το e-diki."); })
-      .finally(() => setLoading((l) => ({ ...l, names: false })));
+      .then((r) => { if (!stale) setNames(r.data || []); })
+      .catch(() => { if (!stale) { setNames([]); toast.error("Δεν ήταν δυνατή η φόρτωση των καταστημάτων από το e-diki."); } })
+      .finally(() => { if (!stale) setLoading((l) => ({ ...l, names: false })); });
+    return () => { stale = true; };
     // eslint-disable-next-line
   }, [f.court_type]);
 
@@ -56,20 +58,24 @@ export default function AddCaseDialog({ open, onClose, onAdded, groups, defaultE
     setKinds([]); setCats([]); upd("court_kind", ""); upd("court_category", "");
     if (!f.court_name) return;
     setLoading((l) => ({ ...l, kinds: true }));
+    let stale = false;
     api.get("/ediki/court-kinds", { params: { courtType: f.court_type, courtName: f.court_name, date: f.court_date } })
-      .then((r) => setKinds(r.data || []))
-      .catch(() => setKinds([]))
-      .finally(() => setLoading((l) => ({ ...l, kinds: false })));
+      .then((r) => { if (!stale) setKinds(r.data || []); })
+      .catch(() => { if (!stale) setKinds([]); })
+      .finally(() => { if (!stale) setLoading((l) => ({ ...l, kinds: false })); });
+    return () => { stale = true; };
   }, [f.court_name]);
 
   useEffect(() => {
     setCats([]); upd("court_category", "");
     if (!f.court_name) return;
     setLoading((l) => ({ ...l, cats: true }));
+    let stale = false;
     api.get("/ediki/court-categories", { params: { courtType: f.court_type, courtName: f.court_name, courtKind: f.court_kind, date: f.court_date } })
-      .then((r) => setCats(r.data || []))
-      .catch(() => setCats([]))
-      .finally(() => setLoading((l) => ({ ...l, cats: false })));
+      .then((r) => { if (!stale) setCats(r.data || []); })
+      .catch(() => { if (!stale) setCats([]); })
+      .finally(() => { if (!stale) setLoading((l) => ({ ...l, cats: false })); });
+    return () => { stale = true; };
   }, [f.court_name, f.court_kind]);
 
   if (!open) return null;

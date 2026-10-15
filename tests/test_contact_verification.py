@@ -29,6 +29,8 @@ class Col:
             if isinstance(v, dict):
                 if "$gte" in v and not d.get(k, "") >= v["$gte"]:
                     return False
+                if "$lt" in v and not d.get(k, 0) < v["$lt"]:
+                    return False
             elif d.get(k) != v:
                 return False
         return True
@@ -38,6 +40,16 @@ class Col:
         if sort:
             hits.sort(key=lambda d: d.get(sort[0][0], ""), reverse=sort[0][1] < 0)
         return dict(hits[0]) if hits else None
+
+    async def find_one_and_update(self, q, upd):
+        for d in self.docs:
+            if self._match(d, q):
+                before = dict(d)
+                d.update(upd.get("$set", {}))
+                for k, n in upd.get("$inc", {}).items():
+                    d[k] = d.get(k, 0) + n
+                return before
+        return None
 
     async def insert_one(self, d):
         self.docs.append(dict(d))

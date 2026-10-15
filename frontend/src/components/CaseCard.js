@@ -3,6 +3,7 @@ import { toast } from "sonner";
 import { RefreshCw, Trash2, MapPin, Gavel, Users, AlertTriangle, WifiOff, FileText } from "lucide-react";
 import api, { errMsg } from "@/lib/api";
 import { StatusBadge, statusOf } from "@/components/status";
+import { formatDate } from "@/lib/utils";
 
 function Ahead({ c }) {
   const k = statusOf(c);
@@ -61,7 +62,7 @@ export default function CaseCard({ c, onChange, onDelete, groupName }) {
 
       <div className="space-y-1.5 text-sm text-[var(--txt-2)] mb-4">
         <div className="flex items-center gap-2"><MapPin className="w-3.5 h-3.5 shrink-0 text-[var(--txt-3)]" />
-          <span className="truncate">{c.court_name} · {new Date(c.court_date).toLocaleDateString("el-GR")}</span></div>
+          <span className="truncate">{c.court_name} · {formatDate(c.court_date)}</span></div>
         <div className="flex items-center gap-2"><Gavel className="w-3.5 h-3.5 shrink-0 text-[var(--txt-3)]" />
           <span className="truncate">{c.court_kind || c.court_type}{c.court_category ? ` · ${c.court_category}` : ""}</span></div>
         {c.my_subject && (
