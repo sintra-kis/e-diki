@@ -57,7 +57,7 @@ export default function GroupsDialog({ open, onClose, groups, onChange }) {
             <label className="label block mb-1.5">Είσοδος με κωδικό</label>
             <div className="flex gap-2">
               <input data-testid="group-code-input" value={code} onChange={(e) => setCode(e.target.value.toUpperCase())}
-                className="field flex-1 px-3 py-2.5 text-sm font-mono" placeholder="π.χ. A1B2C3" />
+                className="field flex-1 px-3 py-2.5 text-sm font-mono" placeholder="π.χ. K7M2XQ9PA4" maxLength={32} />
               <button data-testid="join-group-btn" onClick={join} className="btn-ghost px-4 flex items-center gap-1.5 text-sm"><LogIn className="w-4 h-4" />Είσοδος</button>
             </div>
           </div>

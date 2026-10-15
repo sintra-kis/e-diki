@@ -13,61 +13,9 @@ os.environ.setdefault("JWT_SECRET", "test-secret")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 import server  # noqa: E402
+from tests.fakes import Col  # noqa: E402
 
 U1, U2 = {"id": "u1"}, {"id": "u2"}
-
-
-class Col:
-    """Tiny in-memory stand-in for a motor collection (equality, $gte, $set, $inc, upsert)."""
-
-    def __init__(self):
-        self.docs = []
-
-    @staticmethod
-    def _match(d, q):
-        for k, v in q.items():
-            if isinstance(v, dict):
-                if "$gte" in v and not d.get(k, "") >= v["$gte"]:
-                    return False
-            elif d.get(k) != v:
-                return False
-        return True
-
-    async def find_one(self, q, sort=None):
-        hits = [d for d in self.docs if self._match(d, q)]
-        if sort:
-            hits.sort(key=lambda d: d.get(sort[0][0], ""), reverse=sort[0][1] < 0)
-        return dict(hits[0]) if hits else None
-
-    async def insert_one(self, d):
-        self.docs.append(dict(d))
-
-    async def delete_one(self, q):
-        for d in self.docs:
-            if self._match(d, q):
-                self.docs.remove(d)
-                return
-
-    async def count_documents(self, q):
-        return sum(1 for d in self.docs if self._match(d, q))
-
-    async def update_one(self, q, upd, upsert=False):
-        for d in self.docs:
-            if self._match(d, q):
-                d.update(upd.get("$set", {}))
-                for k, n in upd.get("$inc", {}).items():
-                    d[k] = d.get(k, 0) + n
-                return
-        if upsert:
-            self.docs.append({**q, **upd.get("$set", {})})
-
-    def find(self, q):
-        outer = self
-
-        class Cursor:
-            async def to_list(self, n):
-                return [dict(d) for d in outer.docs if outer._match(d, q)]
-        return Cursor()
 
 
 class DB:

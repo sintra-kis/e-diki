@@ -4,10 +4,10 @@ import { toast } from "sonner";
 import api from "@/lib/api";
 
 const TYPE_ICON = {
-  approaching: "🔔", status_change: "⚖️", progress: "➡️", stuck: "⚠️", feed_down: "📡", feed_restored: "✅",
+  approaching: "🔔", status_change: "⚖️", progress: "➡️", stuck: "⚠️", feed_down: "📡", feed_restored: "✅", verify_needed: "🛡️",
 };
 
-export default function Notifications({ open, onToggle, onCountChange }) {
+export default function Notifications({ open, onToggle, onCountChange, refreshKey }) {
   const [notes, setNotes] = useState([]);
   const seen = useRef(new Set());
   const first = useRef(true);
@@ -34,7 +34,7 @@ export default function Notifications({ open, onToggle, onCountChange }) {
     const t = setInterval(load, 20000);
     return () => clearInterval(t);
     // eslint-disable-next-line
-  }, []);
+  }, [refreshKey]);   // also reload right after the dashboard adds/refreshes a case
 
   const markAll = async () => { await api.post("/notifications/read-all"); load(); };
 

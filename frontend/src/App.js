@@ -19,7 +19,7 @@ function Entry() {
 export default function App() {
   return (
     <AuthProvider>
-      <Toaster position="top-right" theme="dark" richColors closeButton />
+      <Toaster position="top-right" theme="light" closeButton toastOptions={{ style: { borderRadius: 16, boxShadow: "var(--shadow-md)" } }} />
       <BrowserRouter>
         <Routes>
           <Route path="/login" element={<Entry />} />
