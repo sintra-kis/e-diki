@@ -22,6 +22,13 @@ services:
         value: ediki
       - key: JWT_SECRET
         generateValue: true
+      # Render's proxy overwrites X-Forwarded-For, so per-IP rate limits can use the real client IP.
+      - key: TRUST_PROXY
+        value: "1"
+      # Origin of the ediki-web site, e.g. https://ediki-web.onrender.com (no trailing slash).
+      # Comma-separate several. Unset allows any origin.
+      - key: CORS_ORIGINS
+        sync: false
       # Optional: email / SMS / voice notifications stay off when unset.
       - key: EMERGENT_EMAIL_KEY
         sync: false
